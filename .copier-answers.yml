@@ -1,0 +1,12 @@
+# Changes here will be overwritten by Copier
+_commit: 3b67e70
+_src_path: git@github.com:luca-penasa/wolt-python-package-cookiecutter.git
+author_email: luca.penasa@gmail.com
+author_name: Luca Penasa
+github_username: luca-penasa
+module_name: quick_spice_manager
+project_name: Quick Spice Manager
+project_short_desription: Thin layer above planetary-coverage to set up spice kernels
+project_url_slug: quick-spice-manager
+publish_docs_on_gh_pages: true
+publish_package_on_pypi: true

@@ -1,0 +1,33 @@
+name: Release on PyPI and deploy docs
+
+on:
+  push:
+    tags:
+      - 'v*' 
+
+jobs:
+  
+  publish-to-pypi:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/python-poetry-env
+      - name: Publish to PyPI
+        run: |
+          poetry config pypi-token.pypi ${{ secrets.PYPI_TOKEN }} 
+          poetry publish --build --no-interaction
+
+  
+  
+  deploy-docs:
+    runs-on: ubuntu-latest
+      
+    needs: publish-to-pypi  # Ensure this job runs only after publish-to-pypi succeeds
+      
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/python-poetry-env
+      - name: Deploy docs
+        run: poetry run mkdocs gh-deploy --force
+
+  

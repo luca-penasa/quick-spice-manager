@@ -1,0 +1,137 @@
+[tool.poetry]
+name = "quick-spice-manager"
+version = "0.0.1"
+description = ""
+authors = ["Luca Penasa <luca.penasa@gmail.com>"]
+license = "MIT"
+readme = "README.md"
+
+documentation = "https://luca-penasa.github.io/quick-spice-manager"
+homepage = "https://luca-penasa.github.io/quick-spice-manager"
+repository = "https://github.com/luca-penasa/quick-spice-manager"
+
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
+
+packages = [{ include = "quick_spice_manager", from = "src" }]
+
+[tool.poetry.dependencies]
+python = ">=3.10, <4.0"
+importlib-metadata = "^8.5.0"
+loguru = "^0.7.2"
+planetary-coverage = "^1.1.1"
+platformdirs = "^4.3.6"
+pandas = "^2.2.3"
+attrs = "^24.2.0"
+
+[tool.poetry.group.dev.dependencies]
+mkdocstrings = { version = ">=0.23", extras = ["python"] }
+mkdocs-material = "*"
+mypy = "*"
+pre-commit = "*"
+pymdown-extensions = "*"
+pytest = "*"
+pytest-github-actions-annotate-failures = "*"
+pytest-cov = "*"
+pytest-sugar = "^1.0.0"
+python-kacl = "*"
+ruff = ">=0.2.0"
+ipykernel = "^6.29.5"
+nbmake = ">=1.4.6"
+bump-my-version = "^0.27.0"
+rust-just = "^1.36.0"
+pandas-stubs = "^2.2.3.241009"
+vulture = "^2.13"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.ruff]
+target-version = "py310" # The lowest supported version
+
+[tool.ruff.format]
+docstring-code-format = true
+docstring-code-line-length = 20
+
+[tool.ruff.lint]
+# By default, enable all the lint rules.
+# Add to the ignore list below if you don't want some rules.
+# If you need some ignores for certain modules, see tool.ruff.lint.per-file-ignores below.
+# For individual ignore cases, prefer inline `# noqa`s within the code.
+select = ["ALL"]
+ignore = [
+    "ANN",    # Type hints related, let mypy handle these.
+    "ERA001", # allow commented-out code
+    "D",      # Docstrings related, way too strict to our taste
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = [
+    "S101", # "Use of `assert` detected"
+    "ARG",  # "Unused function argument". Fixtures are often unused.
+    "S105", # "Possible hardcoded password".
+]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 10
+
+[tool.ruff.lint.pep8-naming]
+classmethod-decorators = [
+    "classmethod",
+    "pydantic.validator",
+    "pydantic.root_validator",
+]
+
+[tool.pytest.ini_options]
+addopts = """\
+    --cov quick_spice_manager \
+    --cov tests \
+    --cov-report term-missing \
+    --no-cov-on-fail \
+    --nbmake \
+"""
+
+[tool.coverage.report]
+fail_under = 70 # relaxed coverage
+exclude_lines = ['if TYPE_CHECKING:', 'pragma: no cover']
+
+[tool.mypy]
+# This is the global mypy configuration.
+# Avoid changing this!
+strict = true                  # See all the enabled flags `mypy --help | grep -A 10 'Strict mode'`
+disallow_any_unimported = true
+
+# If you need to ignore something for some specific module,
+# add overrides for them. Avoid changing the global config!
+# For example:
+# [[tool.mypy.overrides]]
+# module = [
+#  "my_unpyted_dependency1.*",
+#  "my_unpyted_dependency2.*"
+# ]
+# ignore_missing_imports = true
+
+# [[tool.mypy.overrides]]
+# module = [
+#   "tests/my_thing/test_my_thing",
+# ]
+# disallow_untyped_defs = false
+[tool.bumpversion]
+current_version = "0.0.1"  # Replace with your current version
+
+
+[[tool.bumpversion.files]]
+filename = "pyproject.toml"
+search = 'version = "{current_version}"'
+replace = 'version = "{new_version}"'
