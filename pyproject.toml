@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "quick-spice-manager"
-version = "0.0.1"
+version = "0.0.2"
 description = ""
 authors = ["Luca Penasa <luca.penasa@gmail.com>"]
 license = "MIT"
@@ -128,7 +128,7 @@ disallow_any_unimported = true
 # ]
 # disallow_untyped_defs = false
 [tool.bumpversion]
-current_version = "0.0.1"  # Replace with your current version
+current_version = "0.0.2"  # Replace with your current version
 
 
 [[tool.bumpversion.files]]
