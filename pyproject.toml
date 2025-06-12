@@ -1,15 +1,11 @@
-[tool.poetry]
+[project]
 name = "quick-spice-manager"
 version = "0.0.2"
 description = ""
-authors = ["Luca Penasa <luca.penasa@gmail.com>"]
-license = "MIT"
+authors = [{ name = "Luca Penasa", email = "luca.penasa@gmail.com" }]
+requires-python = ">=3.10, <4.0"
 readme = "README.md"
-
-documentation = "https://luca-penasa.github.io/quick-spice-manager"
-homepage = "https://luca-penasa.github.io/quick-spice-manager"
-repository = "https://github.com/luca-penasa/quick-spice-manager"
-
+license = "MIT"
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
@@ -22,40 +18,53 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Typing :: Typed",
 ]
+dependencies = [
+    "importlib-metadata>=8.5.0,<9",
+    "loguru>=0.7.2,<0.8",
+    "planetary-coverage>=1.1.1,<2",
+    "platformdirs>=4.3.6,<5",
+    "pandas>=2.2.3,<3",
+    "attrs>=24.2.0,<25",
+]
 
-packages = [{ include = "quick_spice_manager", from = "src" }]
+[project.urls]
+Homepage = "https://luca-penasa.github.io/quick-spice-manager"
+Repository = "https://github.com/luca-penasa/quick-spice-manager"
+Documentation = "https://luca-penasa.github.io/quick-spice-manager"
 
-[tool.poetry.dependencies]
-python = ">=3.10, <4.0"
-importlib-metadata = "^8.5.0"
-loguru = "^0.7.2"
-planetary-coverage = "^1.1.1"
-platformdirs = "^4.3.6"
-pandas = "^2.2.3"
-attrs = "^24.2.0"
+[dependency-groups]
+dev = [
+    "mkdocstrings[python]>=0.23",
+    "mkdocs-material",
+    "mypy",
+    "pre-commit",
+    "pymdown-extensions",
+    "pytest",
+    "pytest-github-actions-annotate-failures",
+    "pytest-cov",
+    "pytest-sugar>=1.0.0,<2",
+    "python-kacl",
+    "ruff>=0.2.0",
+    "ipykernel>=6.29.5,<7",
+    "nbmake>=1.4.6",
+    "bump-my-version>=0.27.0,<0.28",
+    "rust-just>=1.36.0,<2",
+    "pandas-stubs>=2.2.3.241009,<3",
+    "vulture~=2.13",
+]
 
-[tool.poetry.group.dev.dependencies]
-mkdocstrings = { version = ">=0.23", extras = ["python"] }
-mkdocs-material = "*"
-mypy = "*"
-pre-commit = "*"
-pymdown-extensions = "*"
-pytest = "*"
-pytest-github-actions-annotate-failures = "*"
-pytest-cov = "*"
-pytest-sugar = "^1.0.0"
-python-kacl = "*"
-ruff = ">=0.2.0"
-ipykernel = "^6.29.5"
-nbmake = ">=1.4.6"
-bump-my-version = "^0.27.0"
-rust-just = "^1.36.0"
-pandas-stubs = "^2.2.3.241009"
-vulture = "^2.13"
+[tool.hatch.build.targets.sdist]
+include = ["src/quick_spice_manager"]
+
+[tool.hatch.build.targets.wheel]
+include = ["src/quick_spice_manager"]
+
+[tool.hatch.build.targets.wheel.sources]
+"src/quick_spice_manager" = "quick_spice_manager"
 
 [build-system]
-requires = ["poetry-core"]
-build-backend = "poetry.core.masonry.api"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
 
 [tool.ruff]
 target-version = "py310" # The lowest supported version
@@ -112,24 +121,8 @@ exclude_lines = ['if TYPE_CHECKING:', 'pragma: no cover']
 strict = true                  # See all the enabled flags `mypy --help | grep -A 10 'Strict mode'`
 disallow_any_unimported = true
 
-# If you need to ignore something for some specific module,
-# add overrides for them. Avoid changing the global config!
-# For example:
-# [[tool.mypy.overrides]]
-# module = [
-#  "my_unpyted_dependency1.*",
-#  "my_unpyted_dependency2.*"
-# ]
-# ignore_missing_imports = true
-
-# [[tool.mypy.overrides]]
-# module = [
-#   "tests/my_thing/test_my_thing",
-# ]
-# disallow_untyped_defs = false
 [tool.bumpversion]
 current_version = "0.0.2"  # Replace with your current version
-
 
 [[tool.bumpversion.files]]
 filename = "pyproject.toml"
