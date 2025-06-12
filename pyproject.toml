@@ -1,6 +1,6 @@
 [project]
 name = "quick-spice-manager"
-version = "0.0.2"
+version = "0.0.3"
 description = ""
 authors = [{ name = "Luca Penasa", email = "luca.penasa@gmail.com" }]
 requires-python = ">=3.10, <4.0"
