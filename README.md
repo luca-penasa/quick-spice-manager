@@ -28,24 +28,19 @@ pip install quick-spice-manager
 
 * Clone this repository
 * Requirements:
-  * [Poetry](https://python-poetry.org/)
+  * [uv](https://docs.astral.sh/uv/)
   * Python 3.10+
 * Create a virtual environment and install the dependencies
 
 ```sh
-poetry install
+uv sync
 ```
 
-* Activate the virtual environment
-
-```sh
-poetry shell
-```
 
 ### Testing
 
 ```sh
-pytest
+uv run pytest
 ```
 
 ### Documentation
@@ -62,7 +57,7 @@ The documentation is automatically generated from the content of the [docs direc
 Releases are done with the command, e.g. incrementing patch:
 
 ```bash
-poetry run just bump patch
+uv run just bump patch
 # also push, of course:
 git push origin main --tags
 ```
@@ -72,7 +67,8 @@ this will update the changelog, commit it, and make a corresponding tag.
 as the CI is not yet configured for publish on pypi it can be done by hand:
 
 ```bash
-poetry publish --build
+uv build
+uv publish --build path/to/wheel
 ```
 #### Automatic release - to be fixed
 
@@ -89,7 +85,7 @@ Find the draft release from the
 
 To update the skeleton of the project using copier:
 ```sh
- pipx run copier update --defaults
+uvx copier update --defaults
 ```
 
 ### Pre-commit
