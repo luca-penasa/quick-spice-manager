@@ -2,19 +2,24 @@
 A wrapper around planetary_coverage.TourConfig, to use within jana.
 """
 
+import os
 import shutil
+
 from pathlib import Path
 
 import pandas
 from attrs import define, field
-
-from .dirs import get_user_kernels_cache_directory
-from .utils import details_coverage_from_metakernels
 from loguru import logger as log
 from planetary_coverage import ESA_MK, TourConfig
+from dotenv import load_dotenv
+from .dirs import get_user_kernels_cache_directory
 
 
-    
+# Load environment variables from .env file at module import time
+
+
+
+
 
 def sizeof_fmt(num: float, suffix: str = "B") -> str:
     """
@@ -39,23 +44,55 @@ class SpiceManager:
     """
 
     # _tour_config: TourConfig = field(default=None)
-    _spacecraft = field(default="JUICE")
-    _download_kernels = field(default=True)
-    _version = field(default="latest")
-    _target = field(default="Jupiter")
-    _instrument = field(default="JANUS")
-    _mk = field(default="plan")
+    _spacecraft: str = field(default="JUICE")
+    _download_kernels: bool = field(default=True)
+    _version: str = field(default="latest")
+    _target: str = field(default="Jupiter")
+    _instrument: str = field(default="JANUS", converter=lambda x: "none" if x is None else x)
+    _mk: str = field(default="plan")
     _kernels_dir: Path | None = field(
         default=None,
         converter=lambda x: Path(x) if x is not None else None,
     )
     _kernels = field(default=None)
 
+    def _process_metakernel_override(self):
+        """
+        Process the SPICE_METAKERNEL environment variable override
+        """
+
+        log.debug("Processing metakernel override from environment variables")
+
+        env_status = load_dotenv()
+        log.debug(f".env file loaded: {env_status}")
+
+
+        # these variables can be used to override the default behavior
+        spice_metakernel = os.environ.get("SPICE_METAKERNEL", None)
+        spice_directory = os.environ.get("SPICE_DIRECTORY", None)
+
+        if spice_metakernel is not None:
+            log.warning(
+                f"Overriding metakernel with SPICE_METAKERNEL={spice_metakernel}. Also disabling automatic download of kernels.",
+            )
+            self._mk = spice_metakernel
+
+            self._download_kernels = False
+
+        if spice_directory is not None:
+            log.warning(
+                f"Overriding kernels directory with SPICE_DIRECTORY={spice_directory}",
+            )
+            self._kernels_dir = Path(spice_directory)
+
     def __attrs_post_init__(self) -> None:
         log.debug("Initializing SpiceManager")
         log.info(
             f"Using user kernels cache directory at {self.user_kernels_cache_directory}",
         )
+
+        self._process_metakernel_override()
+
         if self._mk is None:
             self._mk = self.metakernels[0]
         log.warning(f"Using as default meta-kernel {self._mk}")
