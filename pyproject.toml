@@ -55,6 +55,9 @@ dev = [
     "pandas-stubs>=2.2.3.241009",
     "vulture>=2.13"
 ]
+tests = [
+    "pytest-sugar>=1.1.1",
+]
 
 [tool.hatch.build.targets.sdist]
 include = ["src/quick_spice_manager"]
@@ -112,7 +115,11 @@ addopts = """\
     --cov-report term-missing \
     --no-cov-on-fail \
     --nbmake \
+    --integration \
 """
+markers = [
+    "integration: tests that make real network requests (deselected by default; run with --integration)",
+]
 
 [tool.coverage.report]
 fail_under = 70 # relaxed coverage

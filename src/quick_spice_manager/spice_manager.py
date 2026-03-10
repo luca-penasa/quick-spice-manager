@@ -4,21 +4,31 @@ A wrapper around planetary_coverage.TourConfig, to use within jana.
 
 import os
 import shutil
-
 from pathlib import Path
 
-import pandas
+import pandas as pd
 from attrs import define, field
+from dotenv import load_dotenv
 from loguru import logger as log
 from planetary_coverage import ESA_MK, TourConfig
-from dotenv import load_dotenv
-from .dirs import get_user_kernels_cache_directory
+from planetary_coverage.esa.api import EsaApiNotAvailableError, EsaApiNotFoundError
+from planetary_coverage.trajectory.config import KernelNotFoundError, KernelRemoteNotFoundError
 
+from .dirs import get_user_kernels_cache_directory
+from .ftp_fallback import download_kernels_via_ftp, list_metakernels_via_ftp
+
+# Exceptions that indicate planetary_coverage cannot reach its Bitbucket source.
+_PLANETARY_COVERAGE_NETWORK_ERRORS = (
+    EsaApiNotFoundError,
+    EsaApiNotAvailableError,
+    KernelNotFoundError,
+    KernelRemoteNotFoundError,
+    # FileNotFoundError: raised by planetary_coverage._mk_fname when Bitbucket
+    # returns HTTP 404 (e.g. a versioned TM that only exists on FTP).
+    FileNotFoundError,
+)
 
 # Load environment variables from .env file at module import time
-
-
-
 
 
 def sizeof_fmt(num: float, suffix: str = "B") -> str:
@@ -48,7 +58,10 @@ class SpiceManager:
     _download_kernels: bool = field(default=True)
     _version: str = field(default="latest")
     _target: str = field(default="Jupiter")
-    _instrument: str = field(default="JANUS", converter=lambda x: "none" if x is None else x)
+    _instrument: str = field(
+        default="JANUS",
+        converter=lambda x: "none" if x is None else x,
+    )
     _mk: str = field(default="plan")
     _kernels_dir: Path | None = field(
         default=None,
@@ -65,7 +78,6 @@ class SpiceManager:
 
         env_status = load_dotenv()
         log.debug(f".env file loaded: {env_status}")
-
 
         # these variables can be used to override the default behavior
         spice_metakernel = os.environ.get("SPICE_METAKERNEL", None)
@@ -104,20 +116,49 @@ class SpiceManager:
     def metakernel(self):
         return self.tour_config.kernels[0]
 
-    @property
-    def tour_config(self) -> TourConfig:
-        """Return the tour config with current configuration"""
+    def _tour_config_from_local_tm(self, local_tm: Path) -> TourConfig:
+        """Build a TourConfig from a pre-downloaded local .tm file (no network)."""
         return TourConfig(
             spacecraft=self._spacecraft,
             kernels_dir=self._kernels_dir.as_posix(),
-            download_kernels=self._download_kernels,
-            mk=self._mk,
+            download_kernels=False,
+            mk=local_tm.as_posix(),
             version=self._version,
             target=self._target,
             instrument=self._instrument,
             load_kernels=True,
             kernels=self._kernels,
         )
+
+    @property
+    def tour_config(self) -> TourConfig:
+        """Return the tour config, falling back to ESA FTP if planetary_coverage
+        cannot reach its Bitbucket source.
+        """
+        try:
+            return TourConfig(
+                spacecraft=self._spacecraft,
+                kernels_dir=self._kernels_dir.as_posix(),
+                download_kernels=self._download_kernels,
+                mk=self._mk,
+                version=self._version,
+                target=self._target,
+                instrument=self._instrument,
+                load_kernels=True,
+                kernels=self._kernels,
+            )
+        except _PLANETARY_COVERAGE_NETWORK_ERRORS as exc:
+            log.warning(
+                f"planetary_coverage could not download kernels ({type(exc).__name__}: {exc}); "
+                f"falling back to ESA FTP ({self._spacecraft}, mk='{self._mk}')"
+            )
+            local_tm = download_kernels_via_ftp(
+                spacecraft=self._spacecraft,
+                mk=self._mk,
+                kernels_dir=self._kernels_dir,
+                version=self._version,
+            )
+            return self._tour_config_from_local_tm(local_tm)
 
     @property
     def user_kernels_cache_directory(self) -> Path:
@@ -141,9 +182,19 @@ class SpiceManager:
     @property
     def metakernels(self):
         """
-        Get the list of metakernels for the current spacecraft
+        Get the list of metakernels for the current spacecraft, falling back to
+        ESA FTP if the planetary_coverage API is unavailable.
         """
-        mks = ESA_MK[self._spacecraft].mks
+        try:
+            mks = ESA_MK[self._spacecraft].mks
+        except (EsaApiNotFoundError, EsaApiNotAvailableError) as exc:
+            log.warning(
+                f"Cannot list metakernels from API ({type(exc).__name__}: {exc}); "
+                f"falling back to FTP listing for {self._spacecraft}"
+            )
+            mks = list_metakernels_via_ftp(self._spacecraft)
+            # FTP returns stems already; skip the with_suffix strip below
+            return mks
         mks = [Path(mk).with_suffix("").as_posix() for mk in mks]
         return mks
 
@@ -173,9 +224,12 @@ class SpiceManager:
         self.user_kernels_cache_directory.mkdir(parents=True, exist_ok=True)
 
     @property
-    def config(self):
+    def config(self) -> pd.DataFrame:
+        """
+        Get the current configuration as a pandas DataFrame for display in Jupyter notebooks.
+        """
         tour = self.tour_config  # get a tour config with current configuration
-        table = pandas.DataFrame()
+        table = pd.DataFrame()
         table["key"] = [
             "spacecraft",
             "skd_version",
