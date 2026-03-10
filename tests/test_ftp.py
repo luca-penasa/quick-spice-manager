@@ -1,5 +1,5 @@
 """
-Tests for the FTP fallback module (ftp_fallback.py).
+Tests for the FTP module (ftp.py).
 All network I/O is mocked — no real FTP connection is made.
 """
 
@@ -11,7 +11,7 @@ from unittest.mock import MagicMock, call, patch
 
 import pytest
 
-from quick_spice_manager.ftp_fallback import (
+from quick_spice_manager.ftp import (
     _MISSION_FTP_BASE,
     _canonical_mission,
     _ftp_base,
@@ -213,7 +213,7 @@ def test_list_metakernels_via_ftp():
     mock_ftp = MagicMock()
     mock_ftp.nlst.return_value = fake_entries
 
-    with patch("quick_spice_manager.ftp_fallback.ftplib.FTP", return_value=mock_ftp):
+    with patch("quick_spice_manager.ftp.ftplib.FTP", return_value=mock_ftp):
         result = list_metakernels_via_ftp("JUICE")
 
     assert "juice_plan" in result
@@ -268,7 +268,7 @@ def test_download_kernels_via_ftp(tmp_path: Path):
     mock_ftp.nlst.return_value = [tm_remote]
     mock_ftp.retrbinary.side_effect = fake_retrbinary
 
-    with patch("quick_spice_manager.ftp_fallback.ftplib.FTP", return_value=mock_ftp):
+    with patch("quick_spice_manager.ftp.ftplib.FTP", return_value=mock_ftp):
         local_tm = download_kernels_via_ftp("JUICE", "plan", tmp_path)
 
     # TM file should be written
@@ -290,14 +290,12 @@ def test_download_kernels_via_ftp(tmp_path: Path):
 # ---------------------------------------------------------------------------
 
 
-def test_spice_manager_tour_config_ftp_fallback(tmp_path: Path):
+def test_spice_manager_tour_config_ftp(tmp_path: Path):
     """
-    When TourConfig raises EsaApiNotFoundError, SpiceManager should transparently
-    fall back to FTP and return a TourConfig built from the local .tm file.
+    SpiceManager.tour_config downloads kernels via FTP and passes the local
+    .tm path to TourConfig with download_kernels=False.
     """
     from unittest.mock import patch as _patch
-
-    from planetary_coverage.esa.api import EsaApiNotFoundError
 
     from quick_spice_manager import SpiceManager
 
@@ -321,7 +319,6 @@ def test_spice_manager_tour_config_ftp_fallback(tmp_path: Path):
     mock_ftp.nlst.return_value = [
         f"/data/SPICE/JUICE/kernels/mk/{local_tm.name}"
     ]
-    # No kernels to download, so retrbinary only used for the TM file
     mock_ftp.retrbinary.side_effect = lambda cmd, cb: cb(tm_content)
 
     fake_tour = MagicMock()
@@ -329,10 +326,10 @@ def test_spice_manager_tour_config_ftp_fallback(tmp_path: Path):
     with (
         _patch(
             "quick_spice_manager.spice_manager.TourConfig",
-            side_effect=[EsaApiNotFoundError("401"), fake_tour],
+            return_value=fake_tour,
         ) as mock_tc,
         _patch(
-            "quick_spice_manager.ftp_fallback.ftplib.FTP",
+            "quick_spice_manager.ftp.ftplib.FTP",
             return_value=mock_ftp,
         ),
     ):
@@ -341,14 +338,14 @@ def test_spice_manager_tour_config_ftp_fallback(tmp_path: Path):
             download_kernels=True,
             mk="plan",
         )
-        # Ensure fields have test values (post_init may have changed _mk)
         man._mk = "plan"
         man._kernels_dir = tmp_path
 
         result = man.tour_config
 
     assert result is fake_tour
-    # Second TourConfig call should have mk ending in .tm (absolute path)
-    second_call_kwargs = mock_tc.call_args_list[1][1]
-    assert second_call_kwargs["mk"].endswith(".tm")
-    assert second_call_kwargs["download_kernels"] is False
+    # TourConfig must be called exactly once with a local .tm path
+    mock_tc.assert_called_once()
+    call_kwargs = mock_tc.call_args[1]
+    assert call_kwargs["mk"].endswith(".tm")
+    assert call_kwargs["download_kernels"] is False

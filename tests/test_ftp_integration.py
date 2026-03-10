@@ -28,7 +28,7 @@ from unittest.mock import patch
 import pytest
 
 from quick_spice_manager import SpiceManager
-from quick_spice_manager.ftp_fallback import download_kernels_via_ftp
+from quick_spice_manager.ftp import download_kernels_via_ftp
 
 # Two tiny kernels known to be in the TR03/v461 metakernel.
 _SMALL_KERNELS = [
@@ -50,7 +50,7 @@ _SPACECRAFT = "JUICE"
 def _patch_parse(monkeypatch: pytest.MonkeyPatch) -> None:
     """Restrict kernel list to the two tiny test files."""
     monkeypatch.setattr(
-        "quick_spice_manager.ftp_fallback._parse_mk_kernel_paths",
+        "quick_spice_manager.ftp._parse_mk_kernel_paths",
         lambda _content: _SMALL_KERNELS,
     )
 
@@ -131,14 +131,12 @@ def test_spice_manager_ftp_fallback_integration(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """
-    End-to-end: ``SpiceManager.tour_config`` triggers the FTP fallback when
-    planetary_coverage raises ``FileNotFoundError`` for a version that only
-    exists on FTP (``former_versions/``), downloads the real TM and two small
-    kernels, and calls ``TourConfig`` with the local ``.tm`` path.
+    End-to-end: ``SpiceManager.tour_config`` downloads the versioned TM from
+    FTP (``former_versions/``) and calls ``TourConfig`` with the local ``.tm``
+    path and ``download_kernels=False``.
 
-    The second ``TourConfig`` call is mocked with a ``MagicMock`` so we don't
-    need all mission kernels present — the focus is the FTP download and the
-    correct arguments forwarded to ``TourConfig``.
+    ``TourConfig`` is mocked so we don't need all mission kernels present —
+    the focus is the FTP download and the correct arguments forwarded.
     """
     from unittest.mock import MagicMock, patch as _patch
 
@@ -155,12 +153,7 @@ def test_spice_manager_ftp_fallback_integration(
 
     with _patch(
         "quick_spice_manager.spice_manager.TourConfig",
-        side_effect=[
-            # First call: Bitbucket 404 (version only on FTP)
-            FileNotFoundError(f"`juice_tr03.tm` at `{_VERSION}` does not exist."),
-            # Second call: return a mock (all kernels would be needed for real)
-            fake_tour,
-        ],
+        return_value=fake_tour,
     ) as mock_tc:
         tour = man.tour_config
 
@@ -170,13 +163,13 @@ def test_spice_manager_ftp_fallback_integration(
     assert local_tm.stat().st_size > 0, "TM file is empty"
 
     for rel in _SMALL_KERNELS:
-        assert (tmp_path / rel).exists(), f"Kernel '{rel}' missing after fallback"
+        assert (tmp_path / rel).exists(), f"Kernel '{rel}' missing after FTP download"
         assert (tmp_path / rel).stat().st_size > 0, f"Kernel '{rel}' is empty"
 
-    # Second TourConfig call should use the local .tm path and no downloading
-    assert mock_tc.call_count == 2
-    second_kwargs = mock_tc.call_args_list[1][1]
-    assert second_kwargs["mk"].endswith(".tm"), "Second call must pass local .tm path"
-    assert second_kwargs["download_kernels"] is False
+    # TourConfig must be called once with local .tm path and no downloading
+    mock_tc.assert_called_once()
+    call_kwargs = mock_tc.call_args[1]
+    assert call_kwargs["mk"].endswith(".tm"), "TourConfig must receive a local .tm path"
+    assert call_kwargs["download_kernels"] is False
 
     assert tour is fake_tour

@@ -11,22 +11,9 @@ from attrs import define, field
 from dotenv import load_dotenv
 from loguru import logger as log
 from planetary_coverage import ESA_MK, TourConfig
-from planetary_coverage.esa.api import EsaApiNotAvailableError, EsaApiNotFoundError
-from planetary_coverage.trajectory.config import KernelNotFoundError, KernelRemoteNotFoundError
 
 from .dirs import get_user_kernels_cache_directory
-from .ftp_fallback import download_kernels_via_ftp, list_metakernels_via_ftp
-
-# Exceptions that indicate planetary_coverage cannot reach its Bitbucket source.
-_PLANETARY_COVERAGE_NETWORK_ERRORS = (
-    EsaApiNotFoundError,
-    EsaApiNotAvailableError,
-    KernelNotFoundError,
-    KernelRemoteNotFoundError,
-    # FileNotFoundError: raised by planetary_coverage._mk_fname when Bitbucket
-    # returns HTTP 404 (e.g. a versioned TM that only exists on FTP).
-    FileNotFoundError,
-)
+from .ftp import download_kernels_via_ftp, list_metakernels_via_ftp
 
 # Load environment variables from .env file at module import time
 
@@ -116,8 +103,15 @@ class SpiceManager:
     def metakernel(self):
         return self.tour_config.kernels[0]
 
-    def _tour_config_from_local_tm(self, local_tm: Path) -> TourConfig:
-        """Build a TourConfig from a pre-downloaded local .tm file (no network)."""
+    @property
+    def tour_config(self) -> TourConfig:
+        """Download kernels via ESA FTP and return a TourConfig using local files."""
+        local_tm = download_kernels_via_ftp(
+            spacecraft=self._spacecraft,
+            mk=self._mk,
+            kernels_dir=self._kernels_dir,
+            version=self._version,
+        )
         return TourConfig(
             spacecraft=self._spacecraft,
             kernels_dir=self._kernels_dir.as_posix(),
@@ -129,36 +123,6 @@ class SpiceManager:
             load_kernels=True,
             kernels=self._kernels,
         )
-
-    @property
-    def tour_config(self) -> TourConfig:
-        """Return the tour config, falling back to ESA FTP if planetary_coverage
-        cannot reach its Bitbucket source.
-        """
-        try:
-            return TourConfig(
-                spacecraft=self._spacecraft,
-                kernels_dir=self._kernels_dir.as_posix(),
-                download_kernels=self._download_kernels,
-                mk=self._mk,
-                version=self._version,
-                target=self._target,
-                instrument=self._instrument,
-                load_kernels=True,
-                kernels=self._kernels,
-            )
-        except _PLANETARY_COVERAGE_NETWORK_ERRORS as exc:
-            log.warning(
-                f"planetary_coverage could not download kernels ({type(exc).__name__}: {exc}); "
-                f"falling back to ESA FTP ({self._spacecraft}, mk='{self._mk}')"
-            )
-            local_tm = download_kernels_via_ftp(
-                spacecraft=self._spacecraft,
-                mk=self._mk,
-                kernels_dir=self._kernels_dir,
-                version=self._version,
-            )
-            return self._tour_config_from_local_tm(local_tm)
 
     @property
     def user_kernels_cache_directory(self) -> Path:
@@ -181,22 +145,8 @@ class SpiceManager:
 
     @property
     def metakernels(self):
-        """
-        Get the list of metakernels for the current spacecraft, falling back to
-        ESA FTP if the planetary_coverage API is unavailable.
-        """
-        try:
-            mks = ESA_MK[self._spacecraft].mks
-        except (EsaApiNotFoundError, EsaApiNotAvailableError) as exc:
-            log.warning(
-                f"Cannot list metakernels from API ({type(exc).__name__}: {exc}); "
-                f"falling back to FTP listing for {self._spacecraft}"
-            )
-            mks = list_metakernels_via_ftp(self._spacecraft)
-            # FTP returns stems already; skip the with_suffix strip below
-            return mks
-        mks = [Path(mk).with_suffix("").as_posix() for mk in mks]
-        return mks
+        """List available metakernels for the current spacecraft via ESA FTP."""
+        return list_metakernels_via_ftp(self._spacecraft)
 
     @property
     def cache_size(self):

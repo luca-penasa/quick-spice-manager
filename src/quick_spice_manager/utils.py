@@ -12,21 +12,9 @@ import tempfile
 from pathlib import Path
 
 import pandas as pd
-from planetary_coverage import ESA_MK, TourConfig
-from planetary_coverage.esa.api import EsaApiNotAvailableError, EsaApiNotFoundError
-from planetary_coverage.trajectory.config import KernelNotFoundError, KernelRemoteNotFoundError
+from planetary_coverage import TourConfig
 
-from .ftp_fallback import download_kernels_via_ftp, list_metakernels_via_ftp
-
-_PLANETARY_COVERAGE_NETWORK_ERRORS = (
-    EsaApiNotFoundError,
-    EsaApiNotAvailableError,
-    KernelNotFoundError,
-    KernelRemoteNotFoundError,
-    # FileNotFoundError: raised by planetary_coverage._mk_fname when Bitbucket
-    # returns HTTP 404 (e.g. a versioned TM that only exists on FTP).
-    FileNotFoundError,
-)
+from .ftp import download_kernels_via_ftp, list_metakernels_via_ftp
 
 
 def as_human_readable(dataframe: pd.DataFrame, col_name: str) -> pd.Series:
@@ -43,18 +31,7 @@ def details_coverage_from_metakernels(
     Get the coverage of the metakernels for a given mission.
     Juice only actually for now.
     """
-
-    try:
-        JUICE_MK = ESA_MK[mission]
-        mission_mks = JUICE_MK.mks
-    except (EsaApiNotFoundError, EsaApiNotAvailableError) as exc:
-        from loguru import logger as log
-        log.warning(
-            f"Cannot reach planetary_coverage API ({type(exc).__name__}: {exc}); "
-            f"falling back to FTP listing for {mission}"
-        )
-        mission_mks = [f"{mk}.tm" for mk in list_metakernels_via_ftp(mission)]
-        JUICE_MK = None
+    mission_mks = list_metakernels_via_ftp(mission)
 
     if kernels_dir is None:
         kernels_dir = (
@@ -64,42 +41,24 @@ def details_coverage_from_metakernels(
             .as_posix()
         )
 
-    if JUICE_MK is not None and version == "latest":
-        version = JUICE_MK.latest
-
     data = []
-    for mk in mission_mks:
-        mk_key = mk.replace(".tm", "")
-        try:
-            tc = TourConfig(
-                mk=mk_key,
-                kernels_dir=kernels_dir,
-                download_kernels=True,
-                version=version,
-                spacecraft=mission,
-            )
-        except _PLANETARY_COVERAGE_NETWORK_ERRORS as exc:
-            from loguru import logger as log
-            log.warning(
-                f"planetary_coverage failed for mk='{mk_key}' "
-                f"({type(exc).__name__}: {exc}); using FTP fallback"
-            )
-            local_tm = download_kernels_via_ftp(
-                spacecraft=mission,
-                mk=mk_key,
-                kernels_dir=Path(kernels_dir),
-            )
-            tc = TourConfig(
-                mk=local_tm.as_posix(),
-                kernels_dir=kernels_dir,
-                download_kernels=False,
-                version=version,
-                spacecraft=mission,
-            )
-
+    for mk_stem in mission_mks:
+        local_tm = download_kernels_via_ftp(
+            spacecraft=mission,
+            mk=mk_stem,
+            kernels_dir=Path(kernels_dir),
+            version=version,
+        )
+        tc = TourConfig(
+            mk=local_tm.as_posix(),
+            kernels_dir=kernels_dir,
+            download_kernels=False,
+            version=version,
+            spacecraft=mission,
+        )
         data.append(
             {
-                "metakernel": mk,
+                "metakernel": mk_stem,
                 "coverage_start": tc.coverage[0],
                 "coverage_end": tc.coverage[1],
             },
