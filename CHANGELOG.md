@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## Unreleased
 
+## 0.1.0 - 2026-03-10
+
 ### Added
 
 - **ESA FTP downloads** (`ftp.py`): kernel downloads now go directly to the ESA public FTP server at `ftp://spiftp.esac.esa.int/data/SPICE/`. `planetary_coverage` is only used to load already-local kernels and query coverage — it no longer handles downloading.
