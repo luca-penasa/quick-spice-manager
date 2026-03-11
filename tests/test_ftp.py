@@ -349,3 +349,10 @@ def test_spice_manager_tour_config_ftp(tmp_path: Path):
     call_kwargs = mock_tc.call_args[1]
     assert call_kwargs["mk"].endswith(".tm")
     assert call_kwargs["download_kernels"] is False
+
+
+
+def test_mk_lists():
+    from quick_spice_manager.ftp import list_metakernels_via_ftp
+    assert list_metakernels_via_ftp('rosetta') == ['ROS_OPS', 'ROS_OPS_V350_20220906_001']
+    assert list_metakernels_via_ftp('ROSETTA') == ['ROS_OPS', 'ROS_OPS_V350_20220906_001']

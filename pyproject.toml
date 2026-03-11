@@ -29,6 +29,7 @@ dependencies = [
     "attrs>=24.2.0",
     "python-dotenv>=1.0.0",
     "dotenv>=0.9.9",
+    "tqdm>=4.0",
 ]
 
 [project.urls]

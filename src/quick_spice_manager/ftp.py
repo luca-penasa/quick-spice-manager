@@ -15,6 +15,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from loguru import logger as log
+from tqdm import tqdm
 
 # Default number of parallel FTP connections for kernel downloads.
 # Keep this conservative; ESA FTP limits simultaneous connections per IP.
@@ -108,7 +109,7 @@ def list_metakernels_via_ftp(mission: str) -> list[str]:
     finally:
         ftp.quit()
 
-    return [Path(e).stem for e in entries if e.endswith(".tm")]
+    return [Path(e).stem for e in entries if e.lower().endswith(".tm")]
 
 
 # ---------------------------------------------------------------------------
@@ -165,7 +166,7 @@ def _resolve_tm_on_ftp(
         ) from exc
 
     tm_map: dict[str, str] = {
-        Path(e).name: e for e in entries if e.endswith(".tm")
+        Path(e).name.lower(): e for e in entries if e.lower().endswith(".tm")
     }
 
     # --- Step 1: resolve unversioned TM to obtain the full stem -------------
@@ -207,7 +208,7 @@ def _resolve_tm_on_ftp(
     if not is_versioned:
         return unversioned_path
 
-    stem = Path(unversioned_path).stem  # e.g. "juice_s011_tr03"
+    stem = Path(unversioned_path).stem.lower()  # e.g. "juice_s011_tr03"
     versioned_name = f"{stem}_{version}.tm"
 
     # Check top-level mk/
@@ -220,7 +221,7 @@ def _resolve_tm_on_ftp(
     try:
         fv_entries = ftp.nlst(fv_dir)
         tm_map_fv: dict[str, str] = {
-            Path(e).name: e for e in fv_entries if e.endswith(".tm")
+            Path(e).name.lower(): e for e in fv_entries if e.lower().endswith(".tm")
         }
         if versioned_name in tm_map_fv:
             log.debug(
@@ -415,17 +416,25 @@ def download_kernels_via_ftp(
                 )
                 futures[fut] = local_kernel
 
-            for fut in as_completed(futures):
-                local_kernel = futures[fut]
-                exc = fut.exception()
-                if exc is None:
-                    log.info(f"FTP: downloaded {local_kernel.name}")
-                    n_dl += 1
-                else:
-                    log.warning(
-                        f"FTP: could not download '{local_kernel.name}': {exc}"
-                    )
-                    n_fail += 1
+            with tqdm(
+                total=len(to_download),
+                desc="Downloading kernels",
+                unit="file",
+                dynamic_ncols=True,
+            ) as pbar:
+                for fut in as_completed(futures):
+                    local_kernel = futures[fut]
+                    exc = fut.exception()
+                    if exc is None:
+                        log.info(f"FTP: downloaded {local_kernel.name}")
+                        n_dl += 1
+                        pbar.set_postfix_str(local_kernel.name, refresh=False)
+                    else:
+                        log.warning(
+                            f"FTP: could not download '{local_kernel.name}': {exc}"
+                        )
+                        n_fail += 1
+                    pbar.update(1)
 
     log.info(
         f"FTP: done - {n_dl} downloaded, {n_skip} cached, {n_fail} failed"
