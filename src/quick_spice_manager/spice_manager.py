@@ -106,12 +106,17 @@ class SpiceManager:
     @property
     def tour_config(self) -> TourConfig:
         """Download kernels via ESA FTP and return a TourConfig using local files."""
-        local_tm = download_kernels_via_ftp(
-            spacecraft=self._spacecraft,
-            mk=self._mk,
-            kernels_dir=self._kernels_dir,
-            version=self._version,
-        )
+        mk_path = Path(self._mk)
+        if mk_path.is_file():
+            log.info(f"Metakernel {self._mk} is a local file, skipping online resolution.")
+            local_tm = mk_path
+        else:
+            local_tm = download_kernels_via_ftp(
+                spacecraft=self._spacecraft,
+                mk=self._mk,
+                kernels_dir=self._kernels_dir,
+                version=self._version,
+            )
         return TourConfig(
             spacecraft=self._spacecraft,
             kernels_dir=self._kernels_dir.as_posix(),
