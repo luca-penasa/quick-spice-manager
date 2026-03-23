@@ -16,12 +16,116 @@
 
 ---
 
+`quick-spice-manager` provides a straightforward way to download, cache, and load ESA SPICE kernels for use with [`planetary-coverage`](https://planetary-coverage.readthedocs.io/). The core of the library is an FTP-based download engine that fetches kernels directly from the ESA public FTP server (`spiftp.esac.esa.int`) with parallel transfers and progress reporting. On top of that, `SpiceManager` wraps `planetary_coverage.TourConfig` to handle metakernel resolution, local caching, and environment-based overrides — so you can get a loaded kernel set in a single line.
 
+Supported missions include JUICE, SOLAR-ORBITER, BEPICOLOMBO, MARS-EXPRESS, ROSETTA, and [many more](#supported-missions).
 
 ## Installation
 
 ```sh
 pip install quick-spice-manager
+```
+
+## Usage
+
+### Basic usage
+
+```python
+from quick_spice_manager import SpiceManager
+
+# Downloads kernels automatically from the ESA FTP server and loads them.
+# Kernels are cached in the platform user-cache directory and reused on
+# subsequent calls — no re-download unless the cache is cleared.
+sm = SpiceManager(spacecraft="JUICE", mk="plan")
+
+# Access the underlying planetary_coverage.TourConfig
+tc = sm.tour_config
+
+# Inspect coverage timestamps, compute geometry, etc.
+print(tc.coverage)
+```
+
+### Listing available metakernels
+
+```python
+sm = SpiceManager(spacecraft="JUICE")
+print(sm.metakernels)  # e.g. ['plan', 'ops', ...]
+```
+
+### Inspecting the current configuration
+
+```python
+# Returns a pandas DataFrame — renders as a table in Jupyter
+print(sm.config)
+```
+
+### Cache management
+
+```python
+print(sm.cache_size)   # human-readable size of the kernel cache
+sm.clear_cache()       # delete cached kernels (will re-download on next use)
+```
+
+### Using a local metakernel
+
+Pass an absolute path to an existing `.tm` file to skip FTP resolution:
+
+```python
+sm = SpiceManager(
+    spacecraft="JUICE",
+    mk="/path/to/my_local.tm",
+    kernels_dir="/path/to/kernels",
+)
+tc = sm.tour_config
+```
+
+### Environment variable overrides
+
+Two environment variables (readable from a `.env` file in the working directory) let you override the FTP-based workflow without changing code:
+
+| Variable | Effect |
+|---|---|
+| `SPICE_METAKERNEL` | Path to a local metakernel file. Disables automatic FTP download. |
+| `SPICE_DIRECTORY` | Directory containing the kernel files referenced by the metakernel. |
+
+```sh
+# .env
+SPICE_METAKERNEL=/data/kernels/juice_ops.tm
+SPICE_DIRECTORY=/data/kernels
+```
+
+### Supported missions
+
+The FTP downloader supports the following ESA missions (case-insensitive, common aliases accepted):
+
+| Mission | Accepted names |
+|---|---|
+| BepiColombo | `BEPICOLOMBO`, `MPO`, `MTM`, `MMO` |
+| Comet Interceptor | `COMET-INTERCEPTOR` |
+| EnVision | `ENVISION` |
+| ExoMars 2016 | `EXOMARS2016`, `TGO`, `EDM` |
+| ExoMars RSP | `EXOMARSRSP` |
+| Gaia | `GAIA` |
+| Hera | `HERA` |
+| Huygens | `HUYGENS`, `CASP` |
+| INTEGRAL | `INTEGRAL` |
+| JUICE | `JUICE` |
+| JWST | `JWST` |
+| Mars Express | `MARS-EXPRESS`, `MEX`, `BEAGLE2` |
+| Rosetta | `ROSETTA` |
+| SMART-1 | `SMART-1` |
+| Solar Orbiter | `SOLAR-ORBITER`, `SOLO` |
+| Venus Express | `VENUS-EXPRESS`, `VEX` |
+
+### Logging
+
+Logging is disabled by default. Enable it for debugging:
+
+```python
+from quick_spice_manager import log_enable, log_enable_debug
+
+log_enable()        # INFO level
+log_enable_debug()  # DEBUG level
 ```
 
 ## Development
