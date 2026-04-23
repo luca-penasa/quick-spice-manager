@@ -97,7 +97,7 @@ class SpiceManager:
         converter=lambda x: Path(x) if x is not None else None,
     )
     _kernels = field(default=None)
-    _exclusive: bool = field(default=False)
+    _exclusive: bool = field(default=True)
 
     resolved_mk: Path | None = field(default=None, converter=lambda x: Path(x) if x is not None else None, init=False)
     _saved_kernels: list[str] = field(factory=list, init=False)
@@ -106,6 +106,9 @@ class SpiceManager:
     # Stores the active manager ref that was in place when __enter__ was called,
     # so __exit__ can restore it (correct LIFO ordering for nested context managers).
     _prior_active_ref: "weakref.ref | None" = field(default=None, init=False)
+
+
+        
 
     def _process_metakernel_override(self):
         """
@@ -235,6 +238,21 @@ class SpiceManager:
                 result.append(fname)
         return frozenset(result)
 
+    def _snapshot_pool_entries(self) -> list[str]:
+        """Snapshot current non-META kernel entries that still exist on disk."""
+        n = spiceypy.ktotal("ALL")
+        saved: list[str] = []
+        for i in range(n):
+            fname, ftype, _source, _handle = spiceypy.kdata(i, "ALL")
+            # Skip META entries — these are often temporary metakernel files.
+            if ftype.strip().upper() == "META":
+                continue
+            if Path(fname).exists():
+                saved.append(fname)
+            else:
+                log.debug(f"Snapshot pool: skipping non-existent pool entry: {fname}")
+        return saved
+
     @property
     def is_active(self) -> bool:
         """Whether this manager is the current SPICE pool owner.
@@ -331,14 +349,47 @@ class SpiceManager:
 
         Returns the resolved (original, non-temp) metakernel path.
         """
+        if self._loaded_mk_path is not None:
+            log.warning(
+                "load_kernels() called while this manager is already loaded; "
+                "unloading current state first."
+            )
+            self.unload_kernels()
+
+        # If we are superseding another SpiceManager that owns the pool,
+        # preserve its expected kernel set so unload_kernels() can restore it.
+        # This avoids an extra live pool scan in load_kernels().
+        global _active_manager_ref
+        active_mgr = _active_manager_ref() if _active_manager_ref is not None else None
+        if not self._saved_kernels:
+            if (
+                active_mgr is not None
+                and active_mgr is not self
+                and active_mgr._expected_kernels is not None
+            ):
+                self._saved_kernels = sorted(active_mgr._expected_kernels)
+                log.debug(
+                    "Captured pre-load pool from prior active manager "
+                    f"({len(self._saved_kernels)} kernels)"
+                )
+            else:
+                self._saved_kernels = []
+
         resolved = self._resolve_metakernel()
         self.resolved_mk = resolved
         tmp_path = self._localize_metakernel(resolved)
+
+        if self._exclusive:
+            log.debug("Exclusive mode: clearing pool before loading metakernel")
+            spiceypy.kclear()
+
         log.info(f"Furnishing metakernel {resolved} (localized temp: {tmp_path})")
         spiceypy.furnsh(tmp_path.as_posix())
         self._loaded_mk_path = tmp_path
         self._expected_kernels = self._pool_files()
-        global _active_manager_ref
+
+        # Save who was active before taking ownership (for unload restore).
+        self._prior_active_ref = _active_manager_ref
         _active_manager_ref = weakref.ref(self)
         return resolved
 
@@ -497,80 +548,52 @@ class SpiceManager:
         return out
 
     def unload_kernels(self) -> None:
-        """Unload the currently furnished metakernel and clean up the temp file."""
-        if self._loaded_mk_path is not None:
+        """Unload this manager and restore the pre-load SPICE pool snapshot."""
+        has_snapshot = bool(self._saved_kernels)
+
+        if has_snapshot:
+            log.debug("Restoring SPICE kernel pool to pre-load snapshot")
+            spiceypy.kclear()
+            for fname in self._saved_kernels:
+                if Path(fname).exists():
+                    log.debug(f"Re-furnishing saved kernel: {fname}")
+                    spiceypy.furnsh(fname)
+                else:
+                    log.warning(f"Saved kernel no longer exists on disk, skipping: {fname}")
+            self._saved_kernels = []
+        elif self._loaded_mk_path is not None:
+            # Fallback path for managers created before pool snapshots were used.
             log.info(f"Unloading metakernel from temp file {self._loaded_mk_path}")
             spiceypy.unload(self._loaded_mk_path.as_posix())
+
+        if self._loaded_mk_path is not None:
             try:
                 self._loaded_mk_path.unlink()
             except OSError:
                 log.warning(f"Could not delete temp metakernel file {self._loaded_mk_path}")
             self._loaded_mk_path = None
+
         self.resolved_mk = None
         self._expected_kernels = None
-        # Deregister as active owner only if we still are the active owner.
+
+        # Restore previous active manager reference for nested/manual stacking.
         global _active_manager_ref
-        if _active_manager_ref is not None and _active_manager_ref() is self:
+        if self._prior_active_ref is not None:
+            _active_manager_ref = self._prior_active_ref
+            self._prior_active_ref = None
+        elif _active_manager_ref is not None and _active_manager_ref() is self:
             _active_manager_ref = None
 
     def __enter__(self) -> "SpiceManager":
-        """Snapshot the current SPICE kernel pool, then load our kernels.
-
-        If ``exclusive=True``, the pool is cleared before loading so it
-        contains *exactly* the kernels from the target metakernel during
-        the block.
-
-        On exit the original pool is always fully restored.
-        """
-        n = spiceypy.ktotal("ALL")
-        saved: list[str] = []
-        for i in range(n):
-            fname, ftype, _source, _handle = spiceypy.kdata(i, "ALL")
-            # Skip META entries — these are temp files created by planetary_coverage
-            # that may already be deleted from disk; the kernels they referenced
-            # were loaded individually and will appear as their own entries.
-            if ftype.strip().upper() == "META":
-                continue
-            if Path(fname).exists():
-                saved.append(fname)
-            else:
-                log.debug(f"Context enter: skipping non-existent pool entry: {fname}")
-        self._saved_kernels = saved
-        log.debug(f"Snapshotted {len(saved)} kernels from current SPICE pool")
-        if self._exclusive:
-            log.debug("Exclusive mode: clearing pool before loading metakernel")
-            spiceypy.kclear()
-        # Save whoever was active before we take over, so __exit__ can restore them.
-        global _active_manager_ref
-        self._prior_active_ref = _active_manager_ref
+        """Load kernels and remember current pool so __exit__ can restore it."""
+        self._saved_kernels = self._snapshot_pool_entries()
+        log.debug(f"Snapshotted {len(self._saved_kernels)} kernels from current SPICE pool")
         self.load_kernels()
         return self
 
     def __exit__(self, *_exc) -> bool:
-        """Restore the SPICE kernel pool to the state it was in before ``__enter__``."""
-        log.debug("Restoring SPICE kernel pool to pre-entry state")
-        spiceypy.kclear()
-        for fname in self._saved_kernels:
-            if Path(fname).exists():
-                log.debug(f"Re-furnishing saved kernel: {fname}")
-                spiceypy.furnsh(fname)
-            else:
-                log.warning(f"Saved kernel no longer exists on disk, skipping: {fname}")
-        self._saved_kernels = []
-        # Clean up temp localized metakernel file (pool already cleared above)
-        if self._loaded_mk_path is not None:
-            try:
-                self._loaded_mk_path.unlink()
-            except OSError:
-                log.warning(f"Could not delete temp metakernel file {self._loaded_mk_path}")
-            self._loaded_mk_path = None
-        self.resolved_mk = None
-        self._expected_kernels = None
-        # Restore the manager that was active before we entered, so nested context
-        # managers correctly reactivate the outer manager on exit.
-        global _active_manager_ref
-        _active_manager_ref = self._prior_active_ref
-        self._prior_active_ref = None
+        """Unload kernels and restore the SPICE pool to the pre-entry state."""
+        self.unload_kernels()
         return False
 
     @property
@@ -786,4 +809,6 @@ class SpiceManager:
             tour.mk,
             self._kernels_dir,
         ]
+
+        table.set_index("key", inplace=True)
         return table

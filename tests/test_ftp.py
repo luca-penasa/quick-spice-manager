@@ -285,6 +285,77 @@ def test_download_kernels_via_ftp(tmp_path: Path):
     assert existing_kernel.read_bytes() == b"pre-existing"
 
 
+def test_download_kernels_latest_refreshes_cached_tm(tmp_path: Path):
+    """For version='latest', the TM should be refreshed even when cached."""
+    tm_remote = "/data/SPICE/JUICE/kernels/mk/juice_plan.tm"
+    old_tm_content = textwrap.dedent(
+        r"""
+        KPL/MK
+        \begindata
+             KERNELS_TO_LOAD   = ()
+        \begintext
+        """
+    ).encode()
+    new_tm_content = textwrap.dedent(
+        r"""
+        KPL/MK
+        \begindata
+                         KERNELS_TO_LOAD   = ()
+        \begintext
+        """
+    ).encode()
+
+    local_tm = tmp_path / "mk" / "juice_plan.tm"
+    local_tm.parent.mkdir(parents=True)
+    local_tm.write_bytes(old_tm_content)
+
+    mock_ftp = MagicMock()
+    mock_ftp.nlst.return_value = [tm_remote]
+    mock_ftp.retrbinary.side_effect = lambda cmd, cb: cb(new_tm_content)
+
+    with patch("quick_spice_manager.ftp.ftplib.FTP", return_value=mock_ftp):
+        resolved_tm = download_kernels_via_ftp("JUICE", "plan", tmp_path, version="latest")
+
+    assert resolved_tm == local_tm
+    assert local_tm.read_bytes() == new_tm_content
+    assert mock_ftp.retrbinary.call_count == 1
+
+
+def test_download_kernels_versioned_keeps_cached_tm(tmp_path: Path):
+    """For pinned versions, an already-cached TM should not be re-fetched."""
+    version = "v462_20260223_001"
+    tm_name = f"juice_plan_{version}.tm"
+    tm_remote = f"/data/SPICE/JUICE/kernels/mk/{tm_name}"
+    tm_content = textwrap.dedent(
+        r"""
+        KPL/MK
+        \begindata
+             KERNELS_TO_LOAD   = ()
+        \begintext
+        """
+    ).encode()
+
+    local_tm = tmp_path / "mk" / tm_name
+    local_tm.parent.mkdir(parents=True)
+    local_tm.write_bytes(tm_content)
+
+    mock_ftp = MagicMock()
+    mock_ftp.nlst.return_value = [
+        "/data/SPICE/JUICE/kernels/mk/juice_plan.tm",
+        tm_remote,
+    ]
+    mock_ftp.retrbinary.side_effect = lambda cmd, cb: cb(tm_content)
+
+    with patch("quick_spice_manager.ftp.ftplib.FTP", return_value=mock_ftp):
+        resolved_tm = download_kernels_via_ftp(
+            "JUICE", "plan", tmp_path, version=version
+        )
+
+    assert resolved_tm == local_tm
+    assert local_tm.read_bytes() == tm_content
+    assert mock_ftp.retrbinary.call_count == 0
+
+
 # ---------------------------------------------------------------------------
 # SpiceManager.tour_config FTP fallback integration
 # ---------------------------------------------------------------------------

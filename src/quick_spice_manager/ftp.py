@@ -316,8 +316,9 @@ def download_kernels_via_ftp(
     """
     Download a SPICE metakernel and all referenced kernel files from the ESA FTP.
 
-    Only files not already present locally are downloaded.  The metakernel
-    ``.tm`` file itself is always (re-)fetched when absent.
+    Only files not already present locally are downloaded. For
+    ``version='latest'``, the metakernel ``.tm`` file is re-fetched on every
+    call so newly published kernel references are discovered.
 
     Kernel files are downloaded in parallel using *n_workers* simultaneous FTP
     connections (each worker opens its own connection; FTP is not thread-safe).
@@ -376,7 +377,8 @@ def download_kernels_via_ftp(
         local_tm = kernels_dir / "mk" / tm_filename
 
         # --- Download the .tm file -------------------------------------------
-        if not local_tm.exists():
+        refresh_tm = bool(version) and version.lower() == "latest"
+        if refresh_tm or not local_tm.exists():
             log.info(f"FTP: downloading metakernel {tm_filename}")
             _ftp_download_file(ftp, remote_tm, local_tm)
         else:
