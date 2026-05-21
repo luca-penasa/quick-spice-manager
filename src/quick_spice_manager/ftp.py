@@ -231,11 +231,12 @@ def _resolve_tm_on_ftp(
     except ftplib.error_perm:
         log.debug(f"FTP: no former_versions directory at {fv_dir}")
 
-    log.warning(
-        f"FTP: versioned TM '{versioned_name}' not found in mk/ or former_versions/; "
-        f"falling back to unversioned '{Path(unversioned_path).name}'"
+    raise FileNotFoundError(
+        f"Versioned metakernel '{versioned_name}' not found for mission '{mission}' "
+        f"in mk/ or mk/former_versions/ on {_FTP_HOST}. "
+        f"Use version='latest' to load the current unversioned TM, or check "
+        f"available versions with QuickSpiceManager.metakernels."
     )
-    return unversioned_path
 
 
 def _parse_mk_kernel_paths(tm_content: str) -> list[str]:
