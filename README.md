@@ -46,6 +46,21 @@ sm.load_kernels()
 sm.unload_kernels()
 ```
 
+### Getting a furnshable metakernel path
+
+`resolved_mk` triggers FTP download and PATH_VALUES rewriting without loading
+anything into the SPICE pool, giving you a ready-to-use metakernel path:
+
+```python
+sm = QuickSpiceManager(spacecraft="JUICE", mk="plan")
+
+import spiceypy
+spiceypy.furnsh(str(sm.resolved_mk))  # pool management is yours
+```
+
+The result is cached — repeated access to `sm.resolved_mk` does not re-download
+or recreate the temp file.
+
 ### Context manager
 
 The preferred approach — kernels are loaded on entry and the original kernel
@@ -70,8 +85,26 @@ with QuickSpiceManager(spacecraft="JUICE", mk="plan", exclusive=False) as sm:
 
 ```python
 sm = QuickSpiceManager(spacecraft="JUICE")
-print(sm.metakernels)  # e.g. ['plan', 'ops', ...]
+print(sm.metakernels)  # e.g. ['juice_plan', 'juice_plan_v462_20260223_001', ...]
 ```
+
+### Pinning a specific SKD version
+
+By default `version="latest"` fetches the current unversioned metakernel and
+re-downloads it on each fresh resolution so you always get the latest kernel
+list. To pin a reproducible snapshot, pass the exact version tag from the FTP
+server:
+
+```python
+sm = QuickSpiceManager(spacecraft="JUICE", mk="plan", version="v462_20260223_001")
+sm.load_kernels()
+```
+
+The version tag is the suffix that appears in the versioned filenames listed by
+`sm.metakernels` (e.g. `juice_plan_v462_20260223_001` → tag is
+`v462_20260223_001`). Pinned versions are looked up in `kernels/mk/` first,
+then in `kernels/mk/former_versions/`. A `FileNotFoundError` is raised if the
+tag is not found, rather than silently falling back to a different version.
 
 ### Adding extra kernels
 
