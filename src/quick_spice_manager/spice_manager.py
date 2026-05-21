@@ -15,12 +15,31 @@ from tempfile import NamedTemporaryFile
 
 import pandas as pd
 import spiceypy
-from attrs import define, field
+from attrs import define, field, setters as _setters
 from dotenv import load_dotenv
 from loguru import logger as log
 
 from .dirs import get_user_kernels_cache_directory
 from .ftp import download_kernels_via_ftp, list_metakernels_via_ftp
+
+
+def _invalidate_resolved_mk(instance: "QuickSpiceManager", attrib, new_value):  # type: ignore[type-arg]
+    """attrs on_setattr hook: delete the cached localized metakernel when any
+    resolution-affecting attribute (_mk, _spacecraft, _version, _kernels_dir)
+    is changed after construction."""
+    cached = getattr(instance, "_localized_mk_path", None)
+    if cached is not None:
+        object.__setattr__(instance, "_localized_mk_path", None)
+        # _loaded_mk_path points to the same temp file after load_kernels().
+        # Don't delete it now — unload_kernels() owns cleanup in that case;
+        # spiceypy.unload() needs to re-read the file to know what to unload.
+        loaded = getattr(instance, "_loaded_mk_path", None)
+        if cached != loaded:
+            try:
+                cached.unlink(missing_ok=True)
+            except OSError:
+                pass
+    return new_value
 
 # NAIF constraint: maximum number of characters in a SPICE PATH_VALUES entry.
 # See planetary_coverage.spice.metakernel.KERNEL_MAX_LENGTH.
@@ -83,23 +102,24 @@ class QuickSpiceManager:
     """
 
     # _tour_config: TourConfig = field(default=None)
-    _spacecraft: str = field(default="JUICE")
+    _spacecraft: str = field(default="JUICE", on_setattr=_invalidate_resolved_mk)
     _download_kernels: bool = field(default=True)
-    _version: str = field(default="latest")
+    _version: str = field(default="latest", on_setattr=_invalidate_resolved_mk)
     _target: str = field(default="Jupiter")
     _instrument: str = field(
         default="JANUS",
         converter=lambda x: "none" if x is None else x,
     )
-    _mk: str = field(default="plan")
+    _mk: str = field(default="plan", on_setattr=_invalidate_resolved_mk)
     _kernels_dir: Path | None = field(
         default=None,
         converter=lambda x: Path(x) if x is not None else None,
+        on_setattr=_setters.pipe(_setters.convert, _invalidate_resolved_mk),
     )
     _kernels = field(default=None)
     _exclusive: bool = field(default=True)
 
-    resolved_mk: Path | None = field(default=None, converter=lambda x: Path(x) if x is not None else None, init=False)
+    _localized_mk_path: Path | None = field(default=None, init=False)
     _saved_kernels: list[str] = field(factory=list, init=False)
     _loaded_mk_path: Path | None = field(default=None, init=False)
     _expected_kernels: frozenset[str] | None = field(default=None, init=False)
@@ -109,6 +129,15 @@ class QuickSpiceManager:
 
 
         
+
+    def __del__(self) -> None:
+        """Delete the localized temp metakernel file when the instance is garbage-collected."""
+        path = getattr(self, "_localized_mk_path", None)
+        if path is not None:
+            try:
+                path.unlink(missing_ok=True)
+            except Exception:  # noqa: BLE001
+                pass
 
     def _process_metakernel_override(self):
         """
@@ -344,10 +373,36 @@ class QuickSpiceManager:
             )
         return {"unloaded": unloaded, "restored": restored}
 
+    @property
+    def resolved_mk(self) -> Path:
+        """Path to a localized, ``spiceypy``-furnshable copy of the metakernel.
+
+        Accessing this property triggers FTP download of any kernel files that
+        are not yet present in the local cache, then produces a temporary
+        metakernel file with ``PATH_VALUES`` rewritten to point at the local
+        kernels directory.  The result is cached on the instance; the same path
+        is returned on subsequent calls without repeating the work.
+
+        This does **not** load any kernels into the SPICE pool.  Use it when
+        you want full control over kernel loading::
+
+            sm = QuickSpiceManager(spacecraft="JUICE", mk="plan")
+            spiceypy.furnsh(str(sm.resolved_mk))
+
+        Call :meth:`load_kernels` (or use the context manager) when you want
+        the manager to own the pool and handle cleanup automatically.
+        """
+        if self._localized_mk_path is None:
+            original = self._resolve_metakernel()
+            self._localized_mk_path = self._localize_metakernel(original)
+            log.debug(f"Resolved and localized metakernel to {self._localized_mk_path}")
+        return self._localized_mk_path
+
     def load_kernels(self) -> Path:
         """Download (if needed), localize, and furnish the metakernel.
 
-        Returns the resolved (original, non-temp) metakernel path.
+        Returns the path to the localized temporary metakernel file that was
+        furnished.  This is the same path exposed by :attr:`resolved_mk`.
         """
         if self._loaded_mk_path is not None:
             log.warning(
@@ -375,15 +430,13 @@ class QuickSpiceManager:
             else:
                 self._saved_kernels = []
 
-        resolved = self._resolve_metakernel()
-        self.resolved_mk = resolved
-        tmp_path = self._localize_metakernel(resolved)
+        tmp_path = self.resolved_mk  # triggers download + localization if not already done
 
         if self._exclusive:
             log.debug("Exclusive mode: clearing pool before loading metakernel")
             spiceypy.kclear()
 
-        log.info(f"Furnishing metakernel {resolved} (localized temp: {tmp_path})")
+        log.info(f"Furnishing metakernel {tmp_path}")
         spiceypy.furnsh(tmp_path.as_posix())
         self._loaded_mk_path = tmp_path
         self._expected_kernels = self._pool_files()
@@ -391,7 +444,7 @@ class QuickSpiceManager:
         # Save who was active before taking ownership (for unload restore).
         self._prior_active_ref = _active_manager_ref
         _active_manager_ref = weakref.ref(self)
-        return resolved
+        return tmp_path
 
     def add_kernel(
         self, path: "Path | str | Iterable[Path | str]"
@@ -572,8 +625,15 @@ class QuickSpiceManager:
             except OSError:
                 log.warning(f"Could not delete temp metakernel file {self._loaded_mk_path}")
             self._loaded_mk_path = None
+            self._localized_mk_path = None  # invalidate resolved_mk cache
+        elif self._localized_mk_path is not None:
+            # resolved_mk was accessed without load_kernels() — clean up the temp file.
+            try:
+                self._localized_mk_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            self._localized_mk_path = None
 
-        self.resolved_mk = None
         self._expected_kernels = None
 
         # Restore previous active manager reference for nested/manual stacking.
@@ -622,7 +682,6 @@ class QuickSpiceManager:
             ) from exc
 
         resolved = self._resolve_metakernel()
-        self.resolved_mk = resolved
         return TourConfig(
             spacecraft=self._spacecraft,
             kernels_dir=self._kernels_dir.as_posix(),
