@@ -16,7 +16,7 @@
 
 ---
 
-`quick-spice-manager` provides a straightforward way to download, cache, and load ESA SPICE kernels for use with [`planetary-coverage`](https://planetary-coverage.readthedocs.io/). The core of the library is an FTP-based download engine that fetches kernels directly from the ESA public FTP server (`spiftp.esac.esa.int`) with parallel transfers and progress reporting. On top of that, `SpiceManager` wraps `planetary_coverage.TourConfig` to handle metakernel resolution, local caching, and environment-based overrides — so you can get a loaded kernel set in a single line.
+`quick-spice-manager` provides a straightforward way to download, cache, and load ESA SPICE kernels. The core of the library is an FTP-based download engine that fetches kernels directly from the ESA public FTP server (`spiftp.esac.esa.int`) with parallel transfers and progress reporting. `QuickSpiceManager` handles metakernel resolution, local caching, pool management, and environment-based overrides — so you can get a loaded kernel set with minimal boilerplate. Optional integration with [`planetary-coverage`](https://planetary-coverage.readthedocs.io/) is available as an extras install.
 
 Supported missions include JUICE, SOLAR-ORBITER, BEPICOLOMBO, MARS-EXPRESS, ROSETTA, and [many more](#supported-missions).
 
@@ -26,37 +26,81 @@ Supported missions include JUICE, SOLAR-ORBITER, BEPICOLOMBO, MARS-EXPRESS, ROSE
 pip install quick-spice-manager
 ```
 
+> **Note:** The `SpiceManager` name is a deprecated alias for `QuickSpiceManager` and will be removed in a future release. Use `QuickSpiceManager` in new code.
+
 ## Usage
 
 ### Basic usage
 
 ```python
-from quick_spice_manager import SpiceManager
+from quick_spice_manager import QuickSpiceManager
 
 # Downloads kernels automatically from the ESA FTP server and loads them.
 # Kernels are cached in the platform user-cache directory and reused on
 # subsequent calls — no re-download unless the cache is cleared.
-sm = SpiceManager(spacecraft="JUICE", mk="plan")
+sm = QuickSpiceManager(spacecraft="JUICE", mk="plan")
+sm.load_kernels()
 
-# Access the underlying planetary_coverage.TourConfig
-tc = sm.tour_config
+# ... use spiceypy directly ...
 
-# Inspect coverage timestamps, compute geometry, etc.
-print(tc.coverage)
+sm.unload_kernels()
+```
+
+### Context manager
+
+The preferred approach — kernels are loaded on entry and the original kernel
+pool is automatically restored on exit:
+
+```python
+with QuickSpiceManager(spacecraft="JUICE", mk="plan") as sm:
+    # kernels are loaded here; original pool is restored on exit
+    ...
+```
+
+By default `exclusive=True`, which clears the entire SPICE pool before loading
+so that only the kernels from the chosen metakernel are active. Set
+`exclusive=False` to keep any previously loaded kernels alongside the new ones:
+
+```python
+with QuickSpiceManager(spacecraft="JUICE", mk="plan", exclusive=False) as sm:
+    ...
 ```
 
 ### Listing available metakernels
 
 ```python
-sm = SpiceManager(spacecraft="JUICE")
+sm = QuickSpiceManager(spacecraft="JUICE")
 print(sm.metakernels)  # e.g. ['plan', 'ops', ...]
 ```
 
-### Inspecting the current configuration
+### Adding extra kernels
+
+Kernels furnished via `add_kernel()` are registered as intentional — `is_dirty`
+stays `False` and the pool can be snapshotted including them:
 
 ```python
-# Returns a pandas DataFrame — renders as a table in Jupyter
-print(sm.config)
+sm = QuickSpiceManager(spacecraft="JUICE", mk="plan")
+sm.load_kernels()
+
+sm.add_kernel("/path/to/extra.bc")                          # single file
+sm.add_kernel(["/path/to/a.tls", "/path/to/b.bsp"])        # multiple files
+```
+
+### Saving the current pool state
+
+Write the live SPICE pool to a portable metakernel file that can be re-furnished
+later to reproduce the exact same set of loaded kernels:
+
+```python
+sm.snapshot_pool("/tmp/pool_snapshot.tm")
+```
+
+### Pool management
+
+```python
+print(sm.is_active)   # True if this manager currently owns the SPICE pool
+print(sm.is_dirty)    # True if kernels were added/removed since load_kernels()
+sm.clean_pool()       # unload extras and re-furnish missing kernels
 ```
 
 ### Cache management
@@ -71,12 +115,32 @@ sm.clear_cache()       # delete cached kernels (will re-download on next use)
 Pass an absolute path to an existing `.tm` file to skip FTP resolution:
 
 ```python
-sm = SpiceManager(
+sm = QuickSpiceManager(
     spacecraft="JUICE",
     mk="/path/to/my_local.tm",
     kernels_dir="/path/to/kernels",
 )
+sm.load_kernels()
+```
+
+### planetary-coverage integration
+
+The `tour_config` and `config` properties require the optional
+`planetary-coverage` extra:
+
+```sh
+pip install quick-spice-manager[planetary-coverage]
+```
+
+```python
+sm = QuickSpiceManager(spacecraft="JUICE", mk="plan")
+
+# Returns a planetary_coverage.TourConfig loaded with locally cached kernels.
 tc = sm.tour_config
+print(tc.coverage)
+
+# Returns a pandas DataFrame — renders as a table in Jupyter
+print(sm.config)
 ```
 
 ### Environment variable overrides

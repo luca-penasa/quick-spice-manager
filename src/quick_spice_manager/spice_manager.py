@@ -815,4 +815,4 @@ class QuickSpiceManager:
 
 
 
-SpiceManager = QuickSpiceManager  # alias for backwards compatibility
+SpiceManager = QuickSpiceManager  # deprecated alias — warning issued via __init__.__getattr__

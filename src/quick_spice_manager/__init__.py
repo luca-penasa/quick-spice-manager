@@ -1,4 +1,5 @@
 import sys
+import warnings
 
 from loguru import logger as log
 
@@ -30,6 +31,19 @@ def log_disable(mod: str = "quick_spice_manager") -> None:
     log.disable(mod)
 
 
-from .spice_manager import SpiceManager, QuickSpiceManager
+from .spice_manager import QuickSpiceManager
 
-__all__ = ["SpiceManager"]
+__all__ = ["QuickSpiceManager", "SpiceManager"]
+
+
+def __getattr__(name: str) -> object:
+    if name == "SpiceManager":
+        warnings.warn(
+            "SpiceManager is deprecated and will be removed in a future release. "
+            "Use QuickSpiceManager instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        from .spice_manager import SpiceManager
+        return SpiceManager
+    raise AttributeError(f"module 'quick_spice_manager' has no attribute {name!r}")
