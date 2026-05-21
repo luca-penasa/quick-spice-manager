@@ -30,6 +30,6 @@ def log_disable(mod: str = "quick_spice_manager") -> None:
     log.disable(mod)
 
 
-from .spice_manager import SpiceManager
+from .spice_manager import SpiceManager, QuickSpiceManager
 
 __all__ = ["SpiceManager"]

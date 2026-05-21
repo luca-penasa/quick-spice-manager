@@ -46,7 +46,7 @@ def sizeof_fmt(num: float, suffix: str = "B") -> str:
 
 
 @define
-class SpiceManager:
+class QuickSpiceManager:
     """
     Manages SPICE kernel loading for spacecraft operations.
 
@@ -584,7 +584,7 @@ class SpiceManager:
         elif _active_manager_ref is not None and _active_manager_ref() is self:
             _active_manager_ref = None
 
-    def __enter__(self) -> "SpiceManager":
+    def __enter__(self) -> "QuickSpiceManager":
         """Load kernels and remember current pool so __exit__ can restore it."""
         self._saved_kernels = self._snapshot_pool_entries()
         log.debug(f"Snapshotted {len(self._saved_kernels)} kernels from current SPICE pool")
@@ -812,3 +812,7 @@ class SpiceManager:
 
         table.set_index("key", inplace=True)
         return table
+
+
+
+SpiceManager = QuickSpiceManager  # alias for backwards compatibility
