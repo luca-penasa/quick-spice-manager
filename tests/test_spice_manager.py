@@ -534,6 +534,94 @@ def test_snapshot_pool_is_reproducible_via_localize(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# version parameter resolution
+# ---------------------------------------------------------------------------
+
+
+def test_version_passed_to_download_kernels(tmp_path):
+    """QuickSpiceManager._version is forwarded to download_kernels_via_ftp."""
+    mk = _make_local_mk(tmp_path)
+    sm = SpiceManager(
+        mk="plan",
+        kernels_dir=str(tmp_path),
+        download_kernels=True,
+        version="v461_20260121_001",
+    )
+
+    with patch(
+        "quick_spice_manager.spice_manager.download_kernels_via_ftp",
+        return_value=mk,
+    ) as mock_dl:
+        _ = sm.resolved_mk
+
+    mock_dl.assert_called_once()
+    _, kwargs = mock_dl.call_args
+    assert kwargs.get("version") == "v461_20260121_001"
+
+
+def test_version_latest_passed_to_download_kernels(tmp_path):
+    """Default version='latest' is forwarded as-is."""
+    mk = _make_local_mk(tmp_path)
+    sm = SpiceManager(
+        mk="plan",
+        kernels_dir=str(tmp_path),
+        download_kernels=True,
+        # version not set → defaults to "latest"
+    )
+
+    with patch(
+        "quick_spice_manager.spice_manager.download_kernels_via_ftp",
+        return_value=mk,
+    ) as mock_dl:
+        _ = sm.resolved_mk
+
+    mock_dl.assert_called_once()
+    _, kwargs = mock_dl.call_args
+    assert kwargs.get("version") == "latest"
+
+
+def test_version_change_invalidates_resolved_mk(tmp_path):
+    """Changing _version clears the resolved_mk cache (without deleting the
+    active temp file if kernels are loaded)."""
+    mk = _make_local_mk(tmp_path)
+    sm = _make_sm(tmp_path, mk=mk)
+
+    with patch(
+        "quick_spice_manager.spice_manager.download_kernels_via_ftp",
+        return_value=mk,
+    ):
+        first_path = sm.resolved_mk
+
+    assert sm._localized_mk_path == first_path
+
+    sm._version = "v461_20260121_001"
+
+    assert sm._localized_mk_path is None  # cache invalidated
+    assert not first_path.exists()         # temp file deleted (not loaded)
+
+
+def test_version_change_while_loaded_preserves_temp_file(tmp_path):
+    """If kernels are loaded, changing _version must NOT delete the temp file
+    because spiceypy.unload() needs to re-read it."""
+    mk = _make_local_mk(tmp_path)
+    sm = _make_sm(tmp_path, mk=mk)
+
+    with patch("quick_spice_manager.spice_manager.spiceypy") as mock_spice:
+        mock_spice.ktotal.return_value = 1
+        mock_spice.kdata.return_value = ("/kernels/juice_spk.bsp", "SPK", "file", 0)
+        sm.load_kernels()
+
+    loaded_path = sm._loaded_mk_path
+    assert loaded_path is not None and loaded_path.exists()
+
+    sm._version = "v461_20260121_001"
+
+    assert sm._localized_mk_path is None  # cache pointer cleared
+    assert loaded_path.exists()            # temp file kept — unload_kernels() owns it
+    loaded_path.unlink(missing_ok=True)    # manual cleanup
+
+
+# ---------------------------------------------------------------------------
 # load_kernels / unload_kernels
 # ---------------------------------------------------------------------------
 
@@ -548,9 +636,10 @@ def test_load_kernels_calls_furnsh(tmp_path):
         mock_spice.kdata.return_value = ("/kernels/juice_spk.bsp", "SPK", "file", 0)
         returned = sm.load_kernels()
 
-    assert returned == mk
-    assert sm.resolved_mk == mk
-    # furnsh must have been called with the temp localized file (not the original)
+    assert returned == sm._localized_mk_path  # load_kernels now returns the localized path
+    assert sm.resolved_mk == returned          # resolved_mk is the same localized path
+    assert str(returned) != str(mk)            # localized copy is a different file
+    # furnsh must have been called with the localized file
     assert mock_spice.furnsh.call_count == 1
     furnished_path = mock_spice.furnsh.call_args[0][0]
     assert furnished_path.endswith(".tm")
@@ -577,7 +666,34 @@ def test_unload_kernels_calls_unload_and_cleans_up(tmp_path):
     mock_spice.unload.assert_called_once_with(str(tmp_mk_path))
     assert not tmp_mk_path.exists()
     assert sm._loaded_mk_path is None
-    assert sm.resolved_mk is None
+    assert sm._localized_mk_path is None  # resolved_mk cache cleared by unload_kernels
+
+
+def test_reconfigure_while_loaded_does_not_delete_active_temp_file(tmp_path):
+    """Changing _mk/_version after load_kernels() must NOT delete the temp file —
+    spiceypy.unload() needs to re-read it.  unload_kernels() is still responsible
+    for deleting it afterwards."""
+    mk = _make_local_mk(tmp_path)
+    sm = _make_sm(tmp_path, mk=mk)
+
+    with patch("quick_spice_manager.spice_manager.spiceypy") as mock_spice:
+        mock_spice.ktotal.return_value = 1
+        mock_spice.kdata.return_value = ("/kernels/juice_spk.bsp", "SPK", "file", 0)
+        sm.load_kernels()
+
+    loaded_path = sm._loaded_mk_path
+    assert loaded_path is not None and loaded_path.exists()
+
+    # Reconfigure — should invalidate the resolved_mk cache pointer but NOT
+    # delete the file that is still actively loaded in the pool.
+    sm._mk = "ops"
+
+    assert sm._localized_mk_path is None          # cache pointer cleared
+    assert loaded_path.exists()                   # temp file still on disk
+    assert sm._loaded_mk_path == loaded_path      # load state unchanged
+
+    # Cleanup manually (normally done by unload_kernels).
+    loaded_path.unlink(missing_ok=True)
 
 
 def test_context_manager_nested_restores_active(tmp_path):
@@ -660,7 +776,7 @@ def test_context_manager_non_exclusive_does_not_kclear_on_enter(tmp_path):
     existing_kernel = tmp_path / "preloaded.bsp"
     existing_kernel.write_text("placeholder")
     mk = _make_local_mk(tmp_path)
-    sm = _make_sm(tmp_path, mk=mk)  # exclusive=False by default
+    sm = _make_sm(tmp_path, mk=mk, exclusive=False)
 
     with patch("quick_spice_manager.spice_manager.spiceypy") as mock_spice:
         mock_spice.ktotal.return_value = 1
@@ -681,7 +797,7 @@ def test_context_manager_loads_and_restores(tmp_path):
     existing_kernel = tmp_path / "existing.bsp"
     existing_kernel.write_text("placeholder")
     mk = _make_local_mk(tmp_path)
-    sm = _make_sm(tmp_path, mk=mk)
+    sm = _make_sm(tmp_path, mk=mk, exclusive=False)
 
     with patch("quick_spice_manager.spice_manager.spiceypy") as mock_spice:
         # Simulate one existing kernel in the pool (non-META)
@@ -691,7 +807,7 @@ def test_context_manager_loads_and_restores(tmp_path):
         with sm:
             assert mock_spice.furnsh.call_count == 1  # load_kernels called
 
-        # After exit: kclear called, then existing kernel re-furnished
+        # After exit: kclear called once (restore only, no exclusive clear on enter)
         mock_spice.kclear.assert_called_once()
         assert mock_spice.furnsh.call_count == 2
         second_furnsh_arg = mock_spice.furnsh.call_args_list[1][0][0]

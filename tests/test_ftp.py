@@ -5,6 +5,7 @@ All network I/O is mocked — no real FTP connection is made.
 
 from __future__ import annotations
 
+import ftplib
 import textwrap
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
@@ -185,17 +186,68 @@ def test_resolve_tm_versioned_in_former_versions():
     assert path == fv_path
 
 
-def test_resolve_tm_versioned_fallback_to_unversioned():
-    """When version tag not found anywhere, falls back to unversioned TM."""
+def test_resolve_tm_versioned_fallback_raises(tmp_path):
+    """When version tag not found anywhere, raise FileNotFoundError rather than
+    silently returning the wrong TM."""
     ftp = MagicMock()
     ftp.nlst.side_effect = [
         ["/data/SPICE/JUICE/kernels/mk/juice_plan.tm"],  # mk/
         [],  # former_versions/ — nothing for this version
     ]
-    path = _resolve_tm_on_ftp(
-        ftp, "JUICE", "plan", "/data/SPICE/JUICE/", version="v999_99999999_001"
-    )
+    with pytest.raises(FileNotFoundError, match="v999_99999999_001"):
+        _resolve_tm_on_ftp(
+            ftp, "JUICE", "plan", "/data/SPICE/JUICE/", version="v999_99999999_001"
+        )
+
+
+@pytest.mark.parametrize("version", ["latest", "LATEST", "Latest"])
+def test_resolve_tm_version_latest_returns_unversioned(version: str):
+    """'latest' (any casing) is treated as unversioned — no Step 2 lookup."""
+    ftp = MagicMock()
+    ftp.nlst.return_value = [
+        "/data/SPICE/JUICE/kernels/mk/juice_plan.tm",
+        "/data/SPICE/JUICE/kernels/mk/juice_plan_v462_20260223_001.tm",
+    ]
+    path = _resolve_tm_on_ftp(ftp, "JUICE", "plan", "/data/SPICE/JUICE/", version=version)
     assert path == "/data/SPICE/JUICE/kernels/mk/juice_plan.tm"
+    # former_versions/ must never be listed for 'latest'
+    ftp.nlst.assert_called_once()
+
+
+def test_resolve_tm_version_all_returns_unversioned():
+    """'all' is also treated as unversioned (same as 'latest')."""
+    ftp = MagicMock()
+    ftp.nlst.return_value = [
+        "/data/SPICE/JUICE/kernels/mk/juice_plan.tm",
+        "/data/SPICE/JUICE/kernels/mk/juice_plan_v462_20260223_001.tm",
+    ]
+    path = _resolve_tm_on_ftp(ftp, "JUICE", "plan", "/data/SPICE/JUICE/", version="all")
+    assert path == "/data/SPICE/JUICE/kernels/mk/juice_plan.tm"
+    ftp.nlst.assert_called_once()
+
+
+def test_resolve_tm_version_default_is_unversioned():
+    """Omitting version (default) behaves the same as version='latest'."""
+    ftp = MagicMock()
+    ftp.nlst.return_value = ["/data/SPICE/JUICE/kernels/mk/juice_plan.tm"]
+    path = _resolve_tm_on_ftp(ftp, "JUICE", "plan", "/data/SPICE/JUICE/")
+    assert path == "/data/SPICE/JUICE/kernels/mk/juice_plan.tm"
+    ftp.nlst.assert_called_once()
+
+
+def test_resolve_tm_former_versions_permission_error_raises():
+    """If former_versions/ raises error_perm (directory absent) and the versioned
+    TM is not in mk/ either, raise FileNotFoundError rather than silently
+    falling back to the wrong TM."""
+    ftp = MagicMock()
+    ftp.nlst.side_effect = [
+        ["/data/SPICE/JUICE/kernels/mk/juice_plan.tm"],  # mk/ — no versioned file
+        ftplib.error_perm("550 No such directory"),       # former_versions/ absent
+    ]
+    with pytest.raises(FileNotFoundError, match="v461_20260121_001"):
+        _resolve_tm_on_ftp(
+            ftp, "JUICE", "plan", "/data/SPICE/JUICE/", version="v461_20260121_001"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -366,6 +418,7 @@ def test_spice_manager_tour_config_ftp(tmp_path: Path):
     SpiceManager.tour_config downloads kernels via FTP and passes the local
     .tm path to TourConfig with download_kernels=False.
     """
+    pytest.importorskip("planetary_coverage")
     from unittest.mock import patch as _patch
 
     from quick_spice_manager import SpiceManager
@@ -396,7 +449,7 @@ def test_spice_manager_tour_config_ftp(tmp_path: Path):
 
     with (
         _patch(
-            "quick_spice_manager.spice_manager.TourConfig",
+            "planetary_coverage.TourConfig",  # lazy import inside tour_config property
             return_value=fake_tour,
         ) as mock_tc,
         _patch(
