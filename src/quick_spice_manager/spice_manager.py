@@ -185,7 +185,7 @@ class QuickSpiceManager:
 
     With planetary_coverage TourConfig (requires optional extra)::
 
-        tc = SpiceManager().tour_config
+        tc = SpiceManager().tour_config(target="Jupiter", instrument="JANUS")
         # install with: pip install quick-spice-manager[planetary-coverage]
     """
 
@@ -196,22 +196,15 @@ class QuickSpiceManager:
     # does not turn it into an instance field.
     pool_lock = _pool_lock
 
-    # _tour_config: TourConfig = field(default=None)
     _spacecraft: str = field(default="JUICE", on_setattr=_invalidate_resolved_mk)
     _download_kernels: bool = field(default=True)
     _version: str = field(default="latest", on_setattr=_invalidate_resolved_mk)
-    _target: str = field(default="Jupiter")
-    _instrument: str = field(
-        default="JANUS",
-        converter=lambda x: "none" if x is None else x,
-    )
     _mk: str = field(default="plan", on_setattr=_invalidate_resolved_mk)
     _kernels_dir: Path | None = field(
         default=None,
         converter=lambda x: Path(x) if x is not None else None,
         on_setattr=_setters.pipe(_setters.convert, _invalidate_resolved_mk),
     )
-    _kernels = field(default=None)
     _exclusive: bool = field(default=True)
 
     _localized_mk_path: Path | None = field(default=None, init=False)
@@ -947,17 +940,31 @@ class QuickSpiceManager:
             _pool_lock.release()
         return False
 
-    @property
-    def metakernel(self):
-        return self.tour_config.kernels[0]
-
-    @property
-    def tour_config(self):
+    def tour_config(
+        self,
+        target: str = "Jupiter",
+        instrument: str | None = "JANUS",
+        kernels: "list[str] | None" = None,
+    ):
         """Download kernels via ESA FTP and return a ``TourConfig`` using local files.
+
+        This manager itself carries no target/instrument/kernels-subset state
+        -- those are ``planetary_coverage.TourConfig``'s concerns, not this
+        package's, so they're accepted here as call-time parameters rather
+        than stored on the instance.
 
         Requires the ``planetary-coverage`` optional extra::
 
             pip install quick-spice-manager[planetary-coverage]
+
+        Parameters
+        ----------
+        target:
+            Target body passed to ``TourConfig`` (e.g. ``'Jupiter'``).
+        instrument:
+            Instrument passed to ``TourConfig``, or ``None`` for no instrument.
+        kernels:
+            Optional subset of kernel names to restrict ``TourConfig`` to.
 
         Raises
         ------
@@ -979,10 +986,10 @@ class QuickSpiceManager:
             download_kernels=False,
             mk=resolved.as_posix(),
             version=self._version,
-            target=self._target,
-            instrument=self._instrument,
+            target=target,
+            instrument="none" if instrument is None else instrument,
             load_kernels=True,
-            kernels=self._kernels,
+            kernels=kernels,
         )
 
     @property
@@ -993,16 +1000,6 @@ class QuickSpiceManager:
         kd = get_user_kernels_cache_directory().joinpath(self._spacecraft.lower())
         kd.mkdir(parents=True, exist_ok=True)
         return kd
-
-    def coverage_table(self):
-        """
-        Get the coverage table for the current spacecraft and the different metakernels
-        """
-        return details_coverage_from_metakernels2(
-            kernels_dir=self.user_kernels_cache_directory.as_posix(),
-            mission=self._spacecraft,
-            version=self._version,
-        )
 
     @property
     def metakernels(self):
@@ -1146,12 +1143,17 @@ class QuickSpiceManager:
             f"</div>"
         )
 
-    @property
-    def config(self) -> pd.DataFrame:
+    def config(
+        self,
+        target: str = "Jupiter",
+        instrument: str | None = "JANUS",
+    ) -> pd.DataFrame:
         """
-        Get the current configuration as a pandas DataFrame for display in Jupyter notebooks.
+        Get the current configuration as a pandas DataFrame for display in
+        Jupyter notebooks. Builds a :meth:`tour_config` internally, so
+        requires the ``planetary-coverage`` optional extra.
         """
-        tour = self.tour_config  # get a tour config with current configuration
+        tour = self.tour_config(target=target, instrument=instrument)
         table = pd.DataFrame()
         table["key"] = [
             "spacecraft",

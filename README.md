@@ -188,8 +188,11 @@ sm.load_kernels()
 
 ### planetary-coverage integration
 
-The `tour_config` and `config` properties require the optional
-`planetary-coverage` extra:
+`QuickSpiceManager` itself only handles SPICE kernels — it carries no
+target/instrument/geometry state. `tour_config()` and `config()` are thin,
+on-demand bridges to `planetary_coverage.TourConfig` for downstream analysis,
+taking `target`/`instrument` as call-time parameters instead. Requires the
+optional `planetary-coverage` extra:
 
 ```sh
 pip install quick-spice-manager[planetary-coverage]
@@ -199,11 +202,11 @@ pip install quick-spice-manager[planetary-coverage]
 sm = QuickSpiceManager(spacecraft="JUICE", mk="plan")
 
 # Returns a planetary_coverage.TourConfig loaded with locally cached kernels.
-tc = sm.tour_config
+tc = sm.tour_config(target="Jupiter", instrument="JANUS")
 print(tc.coverage)
 
 # Returns a pandas DataFrame — renders as a table in Jupyter
-print(sm.config)
+print(sm.config(target="Jupiter", instrument="JANUS"))
 ```
 
 ### Environment variable overrides

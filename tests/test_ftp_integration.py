@@ -131,13 +131,14 @@ def test_spice_manager_ftp_fallback_integration(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """
-    End-to-end: ``SpiceManager.tour_config`` downloads the versioned TM from
+    End-to-end: ``SpiceManager.tour_config()`` downloads the versioned TM from
     FTP (``former_versions/``) and calls ``TourConfig`` with the local ``.tm``
     path and ``download_kernels=False``.
 
     ``TourConfig`` is mocked so we don't need all mission kernels present —
     the focus is the FTP download and the correct arguments forwarded.
     """
+    pytest.importorskip("planetary_coverage")
     from unittest.mock import MagicMock, patch as _patch
 
     _patch_parse(monkeypatch)
@@ -152,10 +153,10 @@ def test_spice_manager_ftp_fallback_integration(
     fake_tour = MagicMock()
 
     with _patch(
-        "quick_spice_manager.spice_manager.TourConfig",
+        "planetary_coverage.TourConfig",  # lazy import inside tour_config method
         return_value=fake_tour,
     ) as mock_tc:
-        tour = man.tour_config
+        tour = man.tour_config()
 
     # FTP download verification
     local_tm = tmp_path / "mk" / f"juice_s011_tr03_{_VERSION}.tm"

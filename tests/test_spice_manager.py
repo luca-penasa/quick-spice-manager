@@ -887,7 +887,7 @@ def test_tour_config_raises_without_planetary_coverage(tmp_path):
 
     with patch("builtins.__import__", side_effect=mock_import):
         with pytest.raises(ImportError, match="pip install quick-spice-manager\\[planetary-coverage\\]"):
-            sm.tour_config
+            sm.tour_config()
 
 
 # ---------------------------------------------------------------------------
