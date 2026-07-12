@@ -745,6 +745,41 @@ def test_download_kernels_via_ftp_pinned_version_skips_network_when_cached(
     mock_ftp_cls.assert_not_called()
 
 
+def test_download_kernels_via_ftp_download_kernels_false_uses_cache(tmp_path: Path):
+    """download_kernels=False resolves entirely from the local cache, never
+    touching the network -- even for version='latest', which would
+    otherwise always attempt a live check."""
+    tm_remote = "/data/SPICE/JUICE/kernels/mk/juice_plan.tm"
+    mock_ftp = MagicMock()
+    mock_ftp.nlst.return_value = [tm_remote]
+    mock_ftp.retrbinary.side_effect = lambda cmd, cb: cb(_EMPTY_TM)
+
+    with patch("quick_spice_manager.ftp.ftplib.FTP", return_value=mock_ftp):
+        first = download_kernels_via_ftp("JUICE", "plan", tmp_path)
+
+    with patch("quick_spice_manager.ftp.ftplib.FTP") as mock_ftp_cls:
+        second = download_kernels_via_ftp(
+            "JUICE", "plan", tmp_path, download_kernels=False,
+        )
+
+    assert second == first
+    mock_ftp_cls.assert_not_called()
+
+
+def test_download_kernels_via_ftp_download_kernels_false_raises_when_uncached(
+    tmp_path: Path,
+):
+    """With nothing cached, download_kernels=False raises immediately
+    instead of falling back to the network."""
+    with patch("quick_spice_manager.ftp.ftplib.FTP") as mock_ftp_cls:
+        with pytest.raises(FileNotFoundError, match="download_kernels=False"):
+            download_kernels_via_ftp(
+                "JUICE", "plan", tmp_path, download_kernels=False,
+            )
+
+    mock_ftp_cls.assert_not_called()
+
+
 def test_download_kernels_via_ftp_unresolvable_mk_is_not_treated_as_offline(
     tmp_path: Path,
 ):

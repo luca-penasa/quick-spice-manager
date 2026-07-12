@@ -587,6 +587,45 @@ def test_version_latest_passed_to_download_kernels(tmp_path):
     assert kwargs.get("version") == "latest"
 
 
+def test_download_kernels_flag_forwarded_to_download_kernels_via_ftp(tmp_path):
+    """QuickSpiceManager._download_kernels is forwarded to
+    download_kernels_via_ftp() -- it must actually gate network access,
+    not just be stored inertly."""
+    mk = _make_local_mk(tmp_path)
+    sm = SpiceManager(
+        mk="plan",
+        kernels_dir=str(tmp_path),
+        download_kernels=False,
+    )
+
+    with patch(
+        "quick_spice_manager.spice_manager.download_kernels_via_ftp",
+        return_value=mk,
+    ) as mock_dl:
+        _ = sm.resolved_mk
+
+    mock_dl.assert_called_once()
+    _, kwargs = mock_dl.call_args
+    assert kwargs.get("download_kernels") is False
+
+
+def test_download_kernels_false_raises_without_cache(tmp_path):
+    """End-to-end: download_kernels=False with an unresolvable shortcut and
+    no prior cache raises FileNotFoundError rather than reaching FTP."""
+    sm = SpiceManager(
+        spacecraft="JUICE",
+        mk="plan",
+        kernels_dir=str(tmp_path),
+        download_kernels=False,
+    )
+
+    with patch("quick_spice_manager.ftp.ftplib.FTP") as mock_ftp_cls:
+        with pytest.raises(FileNotFoundError, match="download_kernels=False"):
+            sm.resolved_mk
+
+    mock_ftp_cls.assert_not_called()
+
+
 def test_version_change_invalidates_resolved_mk(tmp_path):
     """Changing _version clears the resolved_mk cache (without deleting the
     active temp file if kernels are loaded)."""

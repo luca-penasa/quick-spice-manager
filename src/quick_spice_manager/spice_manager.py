@@ -41,7 +41,7 @@ if TYPE_CHECKING:
     from contextlib import AbstractContextManager
 
 
-def _invalidate_resolved_mk(instance: "QuickSpiceManager", attrib, new_value):  # type: ignore[type-arg]
+def _invalidate_resolved_mk(instance: "QuickSpiceManager", _attrib, new_value):  # type: ignore[type-arg]
     """attrs on_setattr hook: delete the cached localized metakernel when any
     resolution-affecting attribute (_mk, _spacecraft, _version, _kernels_dir)
     is changed after construction."""
@@ -304,7 +304,13 @@ class QuickSpiceManager:
             self._kernels_dir = self.user_kernels_cache_directory
 
     def _resolve_metakernel(self) -> Path:
-        """Locate the metakernel file, downloading it via FTP if it is not already local."""
+        """Locate the metakernel file, downloading it via FTP if not already local.
+
+        If :attr:`_download_kernels` is ``False``, resolution never touches
+        the network -- it's satisfied entirely from the local resolution
+        cache, raising ``FileNotFoundError`` if no complete cached
+        resolution exists.
+        """
         mk_path = Path(self._mk)
         if mk_path.is_file():
             log.info(f"Metakernel {self._mk} is a local file, skipping FTP resolution.")
@@ -315,6 +321,7 @@ class QuickSpiceManager:
             mk=self._mk,
             kernels_dir=self._kernels_dir,
             version=self._version,
+            download_kernels=self._download_kernels,
         )
 
     def _localize_metakernel(self, mk_path: Path) -> Path:

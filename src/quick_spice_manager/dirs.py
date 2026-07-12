@@ -91,10 +91,3 @@ def get_metakernel_listing_cache_dir() -> Path:
     its own until one is chosen.
     """
     return get_quick_spice_manager_cache_directory() / "metakernel-listings"
-
-
-# def get_user_juice_kernels_cache_directory() -> Path:
-#     """
-#     As above but with the juice specific path
-#     """
-#     return get_quick_spice_manager_cache_directory().joinpath("JUICE")

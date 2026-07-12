@@ -526,6 +526,7 @@ def download_kernels_via_ftp(
     kernels_dir: Path | str,
     version: str = "latest",
     n_workers: int = _N_PARALLEL_DOWNLOADS,
+    download_kernels: bool = True,
 ) -> Path:
     """
     Download a SPICE metakernel and all referenced kernel files from the ESA FTP.
@@ -591,6 +592,11 @@ def download_kernels_via_ftp(
     n_workers:
         Number of parallel FTP connections used for kernel downloads.
         Defaults to :data:`_N_PARALLEL_DOWNLOADS`.
+    download_kernels:
+        If ``False``, never touch the network -- resolve entirely from the
+        local resolution cache (see above). Raises ``FileNotFoundError`` if
+        no complete cached resolution exists for this
+        ``(spacecraft, mk, version)``, instead of falling back to FTP.
 
     Returns
     -------
@@ -602,6 +608,8 @@ def download_kernels_via_ftp(
     ConnectionError
         If the ESA FTP server cannot be reached and no usable local cache
         exists for this ``(spacecraft, mk, version)``.
+    FileNotFoundError
+        If ``download_kernels=False`` and no complete local cache exists.
     """
     kernels_dir = Path(kernels_dir)
     cache_path = get_resolution_cache_path(kernels_dir)
@@ -618,9 +626,10 @@ def download_kernels_via_ftp(
             return candidate
         return None
 
-    # Pinned versions never change once published: reuse a fully-verified
-    # local copy without touching the network at all.
-    if not is_latest:
+    # Pinned versions never change once published, and download_kernels=False
+    # means "never touch the network" regardless of version -- both cases
+    # reuse a fully-verified local copy without any network attempt.
+    if not is_latest or not download_kernels:
         cached_tm = _usable_cached_tm()
         if cached_tm is not None:
             log.debug(
@@ -628,6 +637,13 @@ def download_kernels_via_ftp(
                 f"{cached_tm} -- skipping network check",
             )
             return cached_tm
+        if not download_kernels:
+            raise FileNotFoundError(
+                f"download_kernels=False and no complete local cache is "
+                f"available for spacecraft={spacecraft!r} mk={mk!r} "
+                f"version={version!r}. Enable downloads, or pre-populate "
+                "kernels_dir with the required kernels.",
+            )
 
     try:
         local_tm = _download_kernels_via_ftp_online(
