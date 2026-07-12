@@ -886,7 +886,7 @@ def test_list_metakernels_via_ftp_raises_when_offline_and_uncached():
 
 def test_spice_manager_tour_config_ftp(tmp_path: Path):
     """
-    SpiceManager.tour_config() downloads kernels via FTP and passes the local
+    SpiceManager.tour_config downloads kernels via FTP and passes the local
     .tm path to TourConfig with download_kernels=False.
     """
     pytest.importorskip("planetary_coverage")
@@ -920,7 +920,7 @@ def test_spice_manager_tour_config_ftp(tmp_path: Path):
 
     with (
         _patch(
-            "planetary_coverage.TourConfig",  # lazy import inside tour_config method
+            "planetary_coverage.TourConfig",  # lazy import inside get_tour_config
             return_value=fake_tour,
         ) as mock_tc,
         _patch(
@@ -936,7 +936,7 @@ def test_spice_manager_tour_config_ftp(tmp_path: Path):
         man._mk = "plan"
         man._kernels_dir = tmp_path
 
-        result = man.tour_config()
+        result = man.tour_config
 
     assert result is fake_tour
     # TourConfig must be called exactly once with a local .tm path

@@ -926,7 +926,37 @@ def test_tour_config_raises_without_planetary_coverage(tmp_path):
 
     with patch("builtins.__import__", side_effect=mock_import):
         with pytest.raises(ImportError, match="pip install quick-spice-manager\\[planetary-coverage\\]"):
-            sm.tour_config()
+            sm.tour_config
+
+
+def test_tour_config_property_delegates_to_get_tour_config_defaults(tmp_path):
+    """The tour_config property is a backward-compatible convenience form of
+    get_tour_config() using the documented defaults (target='Jupiter',
+    instrument='JANUS') -- restored for downstream code that accesses
+    `.tour_config` as a plain attribute rather than calling it."""
+    sm = _make_sm(tmp_path)
+    sentinel = object()
+
+    with patch.object(
+        SpiceManager, "get_tour_config", return_value=sentinel,
+    ) as mock_get:
+        result = sm.tour_config
+
+    assert result is sentinel
+    mock_get.assert_called_once_with()
+
+
+def test_config_property_delegates_to_get_config_defaults(tmp_path):
+    """The config property is a backward-compatible convenience form of
+    get_config() using the documented defaults."""
+    sm = _make_sm(tmp_path)
+    sentinel = object()
+
+    with patch.object(SpiceManager, "get_config", return_value=sentinel) as mock_get:
+        result = sm.config
+
+    assert result is sentinel
+    mock_get.assert_called_once_with()
 
 
 # ---------------------------------------------------------------------------

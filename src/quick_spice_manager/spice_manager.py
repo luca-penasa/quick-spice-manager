@@ -185,7 +185,8 @@ class QuickSpiceManager:
 
     With planetary_coverage TourConfig (requires optional extra)::
 
-        tc = SpiceManager().tour_config(target="Jupiter", instrument="JANUS")
+        tc = SpiceManager().tour_config  # default target='Jupiter', instrument='JANUS'
+        tc = SpiceManager().get_tour_config(target="Mars", instrument="OTHER")
         # install with: pip install quick-spice-manager[planetary-coverage]
     """
 
@@ -947,7 +948,7 @@ class QuickSpiceManager:
             _pool_lock.release()
         return False
 
-    def tour_config(
+    def get_tour_config(
         self,
         target: str = "Jupiter",
         instrument: str | None = "JANUS",
@@ -958,7 +959,9 @@ class QuickSpiceManager:
         This manager itself carries no target/instrument/kernels-subset state
         -- those are ``planetary_coverage.TourConfig``'s concerns, not this
         package's, so they're accepted here as call-time parameters rather
-        than stored on the instance.
+        than stored on the instance. Use this method (instead of the
+        :attr:`tour_config` property) when you need a target/instrument other
+        than the defaults.
 
         Requires the ``planetary-coverage`` optional extra::
 
@@ -998,6 +1001,20 @@ class QuickSpiceManager:
             load_kernels=True,
             kernels=kernels,
         )
+
+    @property
+    def tour_config(self):
+        """``TourConfig`` built with the default target/instrument.
+
+        Convenience property form of :meth:`get_tour_config` using
+        ``target='Jupiter'``, ``instrument='JANUS'``. Call
+        :meth:`get_tour_config` directly for a different target/instrument.
+
+        Requires the ``planetary-coverage`` optional extra::
+
+            pip install quick-spice-manager[planetary-coverage]
+        """
+        return self.get_tour_config()
 
     @property
     def user_kernels_cache_directory(self) -> Path:
@@ -1150,17 +1167,19 @@ class QuickSpiceManager:
             f"</div>"
         )
 
-    def config(
+    def get_config(
         self,
         target: str = "Jupiter",
         instrument: str | None = "JANUS",
     ) -> pd.DataFrame:
         """
         Get the current configuration as a pandas DataFrame for display in
-        Jupyter notebooks. Builds a :meth:`tour_config` internally, so
-        requires the ``planetary-coverage`` optional extra.
+        Jupyter notebooks. Builds a :meth:`get_tour_config` internally, so
+        requires the ``planetary-coverage`` optional extra. Call this
+        directly for a target/instrument other than the :attr:`config`
+        property's defaults.
         """
-        tour = self.tour_config(target=target, instrument=instrument)
+        tour = self.get_tour_config(target=target, instrument=instrument)
         table = pd.DataFrame()
         table["key"] = [
             "spacecraft",
@@ -1181,6 +1200,16 @@ class QuickSpiceManager:
 
         table.set_index("key", inplace=True)
         return table
+
+    @property
+    def config(self) -> pd.DataFrame:
+        """Configuration DataFrame built with the default target/instrument.
+
+        Convenience property form of :meth:`get_config` using
+        ``target='Jupiter'``, ``instrument='JANUS'``. Call :meth:`get_config`
+        directly for a different target/instrument.
+        """
+        return self.get_config()
 
 
 
