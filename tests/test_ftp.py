@@ -5,17 +5,25 @@ All network I/O is mocked — no real FTP connection is made.
 
 from __future__ import annotations
 
+import contextlib
 import ftplib
 import textwrap
+import threading
+import time
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
 
+import filelock
 import pytest
 
+from quick_spice_manager import ftp as ftp_module
 from quick_spice_manager.ftp import (
     _MISSION_FTP_BASE,
     _canonical_mission,
+    _download_one_kernel,
     _ftp_base,
+    _ftp_download_file,
+    _locked_download,
     _parse_mk_kernel_paths,
     _resolve_tm_on_ftp,
     download_kernels_via_ftp,
@@ -406,6 +414,434 @@ def test_download_kernels_versioned_keeps_cached_tm(tmp_path: Path):
     assert resolved_tm == local_tm
     assert local_tm.read_bytes() == tm_content
     assert mock_ftp.retrbinary.call_count == 0
+
+
+# ---------------------------------------------------------------------------
+# Atomic writes + cross-process per-file locking
+# ---------------------------------------------------------------------------
+
+
+def test_ftp_download_file_writes_full_content_atomically(tmp_path: Path):
+    """A successful download leaves the destination with the full content and
+    no stray temp (.part) files behind."""
+    local = tmp_path / "kernel.bsp"
+    mock_ftp = MagicMock()
+    mock_ftp.retrbinary.side_effect = lambda cmd, cb: cb(b"kernel-bytes")
+
+    _ftp_download_file(mock_ftp, "/remote/kernel.bsp", local)
+
+    assert local.read_bytes() == b"kernel-bytes"
+    assert list(tmp_path.glob("*.part")) == []
+
+
+def test_ftp_download_file_atomic_no_partial_on_exception(tmp_path: Path):
+    """If the transfer fails mid-write, no partial/destination file is left
+    behind and the exception propagates."""
+    local = tmp_path / "kernel.bsp"
+    mock_ftp = MagicMock()
+
+    def fail_mid_write(cmd, cb):
+        cb(b"partial-bytes")
+        raise OSError("connection reset")
+
+    mock_ftp.retrbinary.side_effect = fail_mid_write
+
+    with pytest.raises(OSError, match="connection reset"):
+        _ftp_download_file(mock_ftp, "/remote/kernel.bsp", local)
+
+    assert not local.exists()
+    assert list(tmp_path.glob("*.part")) == []
+
+
+def test_locked_download_skips_if_already_present(tmp_path: Path):
+    """If the destination already exists, no network call is made."""
+    local = tmp_path / "kernel.bsp"
+    local.write_bytes(b"already-here")
+    mock_ftp = MagicMock()
+
+    downloaded = _locked_download(mock_ftp, "/remote/kernel.bsp", local)
+
+    assert downloaded is False
+    mock_ftp.retrbinary.assert_not_called()
+    assert local.read_bytes() == b"already-here"
+
+
+def test_locked_download_force_redownloads_even_if_present(tmp_path: Path):
+    """force=True (used for version='latest' metakernels) always re-fetches."""
+    local = tmp_path / "juice_plan.tm"
+    local.write_bytes(b"old-content")
+    mock_ftp = MagicMock()
+    mock_ftp.retrbinary.side_effect = lambda cmd, cb: cb(b"new-content")
+
+    downloaded = _locked_download(mock_ftp, "/remote/juice_plan.tm", local, force=True)
+
+    assert downloaded is True
+    assert local.read_bytes() == b"new-content"
+
+
+def test_locked_download_releases_lock_after_call(tmp_path: Path):
+    """The per-file lock is released once _locked_download returns."""
+    local = tmp_path / "kernel.bsp"
+    mock_ftp = MagicMock()
+    mock_ftp.retrbinary.side_effect = lambda cmd, cb: cb(b"data")
+
+    _locked_download(mock_ftp, "/remote/kernel.bsp", local)
+
+    lock_path = local.parent / f"{local.name}.lock"
+    lock = filelock.FileLock(str(lock_path), timeout=1)
+    lock.acquire()  # would raise Timeout if the original lock were still held
+    lock.release()
+
+
+def test_locked_download_concurrent_same_file_downloads_once(tmp_path: Path):
+    """Two threads racing to fetch the same missing file result in exactly
+    one real download; the loser reuses the file the winner wrote."""
+    local = tmp_path / "kernel.bsp"
+    call_count = 0
+    call_lock = threading.Lock()
+
+    def fake_retrbinary(cmd, cb):
+        nonlocal call_count
+        with call_lock:
+            call_count += 1
+        time.sleep(0.2)  # widen the window so both threads overlap
+        cb(b"kernel-bytes")
+
+    results: list[bool] = []
+    results_lock = threading.Lock()
+
+    def worker():
+        ftp = MagicMock()
+        ftp.retrbinary.side_effect = fake_retrbinary
+        downloaded = _locked_download(ftp, "/remote/kernel.bsp", local)
+        with results_lock:
+            results.append(downloaded)
+
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5)
+
+    assert all(not t.is_alive() for t in threads)
+    assert call_count == 1
+    assert sorted(results) == [False, True]
+    assert local.read_bytes() == b"kernel-bytes"
+
+
+def test_download_one_kernel_routes_through_locked_download(tmp_path: Path):
+    """_download_one_kernel skips the download if the file already exists,
+    proving it goes through _locked_download rather than an unconditional
+    _ftp_download_file call."""
+    local = tmp_path / "kernel.bsp"
+    local.write_bytes(b"already-here")
+    mock_ftp = MagicMock()
+
+    with patch("quick_spice_manager.ftp.ftplib.FTP", return_value=mock_ftp):
+        _download_one_kernel("spiftp.esac.esa.int", "/remote/kernel.bsp", local)
+
+    mock_ftp.retrbinary.assert_not_called()
+    assert local.read_bytes() == b"already-here"
+
+
+# ---------------------------------------------------------------------------
+# Cross-process connection-count bounding
+#
+# Note: tests/conftest.py's autouse _isolate_ftp_connection_lock_dir fixture
+# redirects get_ftp_connection_lock_dir() into a throwaway tmp dir for every
+# test, so these never touch the real user cache directory or contend with
+# a real concurrent process's connection slots.
+# ---------------------------------------------------------------------------
+
+
+def test_ftp_connection_slot_bounds_concurrent_connections():
+    """No more than _MAX_CONCURRENT_FTP_CONNECTIONS slots can be held at
+    once; extra contenders wait until one is released."""
+    max_slots = ftp_module._MAX_CONCURRENT_FTP_CONNECTIONS
+    release = threading.Event()
+    concurrent_count = 0
+    max_concurrent_seen = 0
+    count_lock = threading.Lock()
+
+    def hold_slot():
+        nonlocal concurrent_count, max_concurrent_seen
+        with ftp_module._ftp_connection_slot():
+            with count_lock:
+                concurrent_count += 1
+                max_concurrent_seen = max(max_concurrent_seen, concurrent_count)
+            release.wait(timeout=5)
+            with count_lock:
+                concurrent_count -= 1
+
+    threads = [threading.Thread(target=hold_slot) for _ in range(max_slots + 2)]
+    for t in threads:
+        t.start()
+
+    time.sleep(0.3)  # let every thread attempt acquisition
+    assert concurrent_count == max_slots  # extras are waiting, not "inside"
+
+    release.set()
+    for t in threads:
+        t.join(timeout=5)
+
+    assert all(not t.is_alive() for t in threads)
+    assert max_concurrent_seen == max_slots
+
+
+def test_ftp_connection_slot_releases_on_exception(monkeypatch):
+    """A slot must be released even when the body raises, otherwise repeated
+    failures would permanently exhaust every slot."""
+    monkeypatch.setattr(ftp_module, "_CONNECTION_SLOT_TIMEOUT_SECONDS", 1)
+    max_slots = ftp_module._MAX_CONCURRENT_FTP_CONNECTIONS
+
+    for _ in range(max_slots + 3):
+        with pytest.raises(RuntimeError, match="boom"):
+            with ftp_module._ftp_connection_slot():
+                raise RuntimeError("boom")
+
+
+def test_download_one_kernel_uses_connection_slot(tmp_path: Path):
+    """_download_one_kernel acquires a connection slot around its FTP call."""
+    local = tmp_path / "kernel.bsp"
+    mock_ftp = MagicMock()
+    mock_ftp.retrbinary.side_effect = lambda cmd, cb: cb(b"data")
+
+    with (
+        patch.object(
+            ftp_module, "_ftp_connection_slot",
+            return_value=contextlib.nullcontext(),
+        ) as mock_slot,
+        patch("quick_spice_manager.ftp.ftplib.FTP", return_value=mock_ftp),
+    ):
+        _download_one_kernel("host", "/remote/kernel.bsp", local)
+
+    mock_slot.assert_called_once()
+
+
+def test_list_metakernels_uses_connection_slot():
+    """list_metakernels_via_ftp acquires a connection slot around its FTP call."""
+    mock_ftp = MagicMock()
+    mock_ftp.nlst.return_value = ["/data/SPICE/JUICE/kernels/mk/juice_plan.tm"]
+
+    with (
+        patch.object(
+            ftp_module, "_ftp_connection_slot",
+            return_value=contextlib.nullcontext(),
+        ) as mock_slot,
+        patch("quick_spice_manager.ftp.ftplib.FTP", return_value=mock_ftp),
+    ):
+        list_metakernels_via_ftp("JUICE")
+
+    mock_slot.assert_called_once()
+
+
+def test_download_kernels_via_ftp_uses_connection_slot(tmp_path: Path):
+    """download_kernels_via_ftp's main connection acquires a connection slot,
+    in addition to the per-worker slots taken by _download_one_kernel."""
+    tm_content = textwrap.dedent(
+        r"""
+        KPL/MK
+        \begindata
+             KERNELS_TO_LOAD   = ()
+        \begintext
+        """,
+    ).encode()
+    mock_ftp = MagicMock()
+    mock_ftp.nlst.return_value = ["/data/SPICE/JUICE/kernels/mk/juice_plan.tm"]
+    mock_ftp.retrbinary.side_effect = lambda cmd, cb: cb(tm_content)
+
+    with (
+        patch.object(
+            ftp_module, "_ftp_connection_slot",
+            return_value=contextlib.nullcontext(),
+        ) as mock_slot,
+        patch("quick_spice_manager.ftp.ftplib.FTP", return_value=mock_ftp),
+    ):
+        download_kernels_via_ftp("JUICE", "plan", tmp_path)
+
+    mock_slot.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Offline / connectivity-failure fallback
+#
+# Note: tests/conftest.py's autouse fixture redirects
+# get_metakernel_listing_cache_dir() into a fresh tmp dir per test, so the
+# list_metakernels_via_ftp() cache tests below never touch the real user
+# cache directory and never see stale data from other tests.
+# ---------------------------------------------------------------------------
+
+_EMPTY_TM = textwrap.dedent(
+    r"""
+    KPL/MK
+    \begindata
+         KERNELS_TO_LOAD   = ()
+    \begintext
+    """,
+).encode()
+
+
+def test_download_kernels_via_ftp_falls_back_to_cache_on_connection_error(
+    tmp_path: Path,
+):
+    """A prior successful resolution is reused (with a warning, not an
+    error) when a later call can't reach the FTP server at all."""
+    tm_remote = "/data/SPICE/JUICE/kernels/mk/juice_plan.tm"
+    mock_ftp = MagicMock()
+    mock_ftp.nlst.return_value = [tm_remote]
+    mock_ftp.retrbinary.side_effect = lambda cmd, cb: cb(_EMPTY_TM)
+
+    with patch("quick_spice_manager.ftp.ftplib.FTP", return_value=mock_ftp):
+        first = download_kernels_via_ftp("JUICE", "plan", tmp_path)
+
+    with patch(
+        "quick_spice_manager.ftp.ftplib.FTP",
+        side_effect=OSError("Network is unreachable"),
+    ):
+        second = download_kernels_via_ftp("JUICE", "plan", tmp_path)
+
+    assert second == first
+    assert second.exists()
+
+
+def test_download_kernels_via_ftp_raises_clear_error_when_offline_and_uncached(
+    tmp_path: Path,
+):
+    """With no prior successful resolution to fall back to, a connectivity
+    failure raises a clear, actionable ConnectionError."""
+    with (
+        patch(
+            "quick_spice_manager.ftp.ftplib.FTP",
+            side_effect=OSError("Network is unreachable"),
+        ),
+        pytest.raises(ConnectionError, match="Could not reach the ESA FTP server"),
+    ):
+        download_kernels_via_ftp("JUICE", "plan", tmp_path)
+
+
+def test_download_kernels_via_ftp_pinned_version_skips_network_when_cached(
+    tmp_path: Path,
+):
+    """Once a pinned (non-'latest') version is fully resolved and cached,
+    later calls for the same (spacecraft, mk, version) never touch the
+    network at all -- pinned versions never change once published."""
+    version = "v462_20260223_001"
+    tm_name = f"juice_plan_{version}.tm"
+    tm_remote = f"/data/SPICE/JUICE/kernels/mk/{tm_name}"
+    mock_ftp = MagicMock()
+    mock_ftp.nlst.return_value = [
+        "/data/SPICE/JUICE/kernels/mk/juice_plan.tm",
+        tm_remote,
+    ]
+    mock_ftp.retrbinary.side_effect = lambda cmd, cb: cb(_EMPTY_TM)
+
+    with patch("quick_spice_manager.ftp.ftplib.FTP", return_value=mock_ftp):
+        first = download_kernels_via_ftp("JUICE", "plan", tmp_path, version=version)
+
+    with patch("quick_spice_manager.ftp.ftplib.FTP") as mock_ftp_cls:
+        second = download_kernels_via_ftp("JUICE", "plan", tmp_path, version=version)
+
+    assert second == first
+    mock_ftp_cls.assert_not_called()
+
+
+def test_download_kernels_via_ftp_unresolvable_mk_is_not_treated_as_offline(
+    tmp_path: Path,
+):
+    """A legitimate 'no such metakernel' answer from a server that responded
+    just fine must propagate as FileNotFoundError, not be swallowed into a
+    ConnectionError or offline fallback."""
+    mock_ftp = MagicMock()
+    mock_ftp.nlst.return_value = ["/data/SPICE/JUICE/kernels/mk/juice_other.tm"]
+
+    with (
+        patch("quick_spice_manager.ftp.ftplib.FTP", return_value=mock_ftp),
+        pytest.raises(FileNotFoundError, match="Cannot find a metakernel"),
+    ):
+        download_kernels_via_ftp("JUICE", "totally_bogus_shortcut", tmp_path)
+
+
+def test_download_kernels_via_ftp_incomplete_cache_reports_missing_kernels(
+    tmp_path: Path,
+):
+    """If a cached resolution's .tm file is missing some of its referenced
+    kernels (e.g. a prior download was interrupted) and the server can't be
+    reached, the resulting error names the missing files."""
+    tm_remote = "/data/SPICE/JUICE/kernels/mk/juice_plan.tm"
+    tm_with_kernel = textwrap.dedent(
+        r"""
+        KPL/MK
+        \begindata
+             PATH_VALUES       = ( '..' )
+             PATH_SYMBOLS      = ( 'KERNELS' )
+             KERNELS_TO_LOAD   = (
+                                   '$KERNELS/fk/juice_v45.tf'
+                                 )
+        \begintext
+        """,
+    ).encode()
+
+    mock_ftp = MagicMock()
+    mock_ftp.nlst.return_value = [tm_remote]
+
+    def fake_retrbinary(cmd, cb):
+        remote = cmd.split(" ", 1)[1]
+        if remote == tm_remote:
+            cb(tm_with_kernel)
+        else:
+            raise OSError("Network is unreachable")  # kernel download drops
+
+    mock_ftp.retrbinary.side_effect = fake_retrbinary
+
+    with patch("quick_spice_manager.ftp.ftplib.FTP", return_value=mock_ftp):
+        # The .tm downloads fine but its referenced kernel fails -- the
+        # existing partial-failure-tolerant behavior still "succeeds"
+        # overall and records a resolution cache entry.
+        download_kernels_via_ftp("JUICE", "plan", tmp_path)
+
+    assert not (tmp_path / "fk" / "juice_v45.tf").exists()
+
+    with (
+        patch(
+            "quick_spice_manager.ftp.ftplib.FTP",
+            side_effect=OSError("Network is unreachable"),
+        ),
+        pytest.raises(ConnectionError, match="incomplete"),
+    ):
+        download_kernels_via_ftp("JUICE", "plan", tmp_path)
+
+
+def test_list_metakernels_via_ftp_falls_back_to_cached_listing():
+    """A prior successful listing is reused (with a warning) when a later
+    call can't reach the FTP server."""
+    mock_ftp = MagicMock()
+    mock_ftp.nlst.return_value = [
+        "/data/SPICE/JUICE/kernels/mk/juice_plan.tm",
+        "/data/SPICE/JUICE/kernels/mk/juice_ops.tm",
+    ]
+
+    with patch("quick_spice_manager.ftp.ftplib.FTP", return_value=mock_ftp):
+        first = list_metakernels_via_ftp("JUICE")
+
+    with patch(
+        "quick_spice_manager.ftp.ftplib.FTP",
+        side_effect=OSError("Network is unreachable"),
+    ):
+        second = list_metakernels_via_ftp("JUICE")
+
+    assert second == first
+
+
+def test_list_metakernels_via_ftp_raises_when_offline_and_uncached():
+    """With nothing cached, a connectivity failure raises a clear error."""
+    with (
+        patch(
+            "quick_spice_manager.ftp.ftplib.FTP",
+            side_effect=OSError("Network is unreachable"),
+        ),
+        pytest.raises(ConnectionError, match="Could not reach the ESA FTP server"),
+    ):
+        list_metakernels_via_ftp("JUICE")
 
 
 # ---------------------------------------------------------------------------

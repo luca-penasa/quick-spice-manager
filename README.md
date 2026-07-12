@@ -136,6 +136,36 @@ print(sm.is_dirty)    # True if kernels were added/removed since load_kernels()
 sm.clean_pool()       # unload extras and re-furnish missing kernels
 ```
 
+### Documenting which kernels were used
+
+`kernel_provenance()` reports the minimum information needed to reproduce
+the currently active kernel set — e.g. when generating PDS4 labels for
+processing performed on downlinked data. Rather than flattening every
+individual kernel file, it cites the metakernel itself (its real, resolved
+filename — with the SKD version baked in when pinned) plus only the kernels
+added on top of it (e.g. via `add_kernel()`):
+
+```python
+info = sm.kernel_provenance()
+info["metakernel"]       # '.../juice_plan_v462_20260223_001.tm'
+info["spacecraft"]       # 'JUICE'
+info["version"]          # 'v462_20260223_001' (or 'latest')
+info["resolved_at"]      # ISO-8601 UTC timestamp of when this was resolved --
+                          # the closest thing to a version string when
+                          # version='latest' was used
+info["extra_kernels"]    # kernels added beyond the metakernel, e.g. via add_kernel()
+info["all_kernels"]      # every kernel currently loaded, flattened
+```
+
+Pass `source="pool"` to inspect the live SPICE pool directly instead of this
+manager's own bookkeeping — useful when kernels were furnished by another
+manager instance or via raw `spiceypy` calls (works even without ever
+calling `load_kernels()` on this instance):
+
+```python
+info = sm.kernel_provenance(source="pool")
+```
+
 ### Cache management
 
 ```python
@@ -224,6 +254,82 @@ from quick_spice_manager import log_enable, log_enable_debug
 log_enable()        # INFO level
 log_enable_debug()  # DEBUG level
 ```
+
+### Concurrency & multi-process safety
+
+The underlying CSPICE toolkit keeps a single, process-global kernel pool that
+is not thread-safe. `quick-spice-manager` handles this with a two-tier model:
+
+1. **In-process (threads)**: every pool operation (`load_kernels`,
+   `unload_kernels`, `add_kernel`, `clean_pool`, pool queries) is serialized
+   by a single re-entrant lock. `with QuickSpiceManager(...) as sm:` holds
+   this lock for the *entire* block, so the whole load → use → unload
+   lifecycle is one critical section — a second thread's `with` block (or a
+   direct `load_kernels()` call) waits until the first one fully exits.
+   Advanced users calling `spiceypy` directly can join the same critical
+   section via `QuickSpiceManager.pool_lock`.
+2. **Cross-process (the on-disk kernel cache)**: kernel downloads write to a
+   temp file and atomically rename it into place, so a reader never sees a
+   truncated file, and each destination file is guarded by its own
+   cross-process lock, so two processes racing to fetch the same missing
+   kernel only download it once. `clear_cache()` is serialized against other
+   `clear_cache()` calls the same way.
+3. **Cross-process (total FTP connection count)**: per-file locking alone
+   doesn't stop many independent managers or processes from each opening
+   their own batch of parallel FTP connections at once. A small, fixed
+   number of connection "slots" (shared by every `QuickSpiceManager`
+   instance and OS process for this user, regardless of mission or
+   `kernels_dir`) bounds the total number of simultaneous connections to
+   ESA's FTP server machine-wide, so a burst of concurrent downloads waits
+   its turn instead of overwhelming the server.
+4. **Cross-process (resolving + furnishing)**: `load_kernels()` also takes a
+   turn in a small, bounded pool of "furnish slots" scoped per `kernels_dir`,
+   held across both the resolve/download-check step and the actual
+   `furnsh()` calls. This keeps a burst of managers/processes cold-starting
+   against the same cache directory from all hammering the same kernel files
+   at once — by the time a manager gets its turn, an earlier holder has
+   usually already finished preparing everything, so its own prepare step is
+   a fast, local no-op. Different missions (different `kernels_dir`) never
+   wait on each other.
+
+Separate OS processes never need to coordinate over `furnsh`/`unload`/pool
+*queries* once kernels are loaded — each process owns an independent CSPICE
+kernel pool, so read-only querying across processes works without any
+locking. The furnish-slot mechanism above only throttles the *loading* step
+itself (a resource/throughput concern, not a correctness one), not anything
+that happens afterwards. Only the shared cache *directory*, the FTP
+connection count, and the furnish/prepare step are genuinely cross-process
+resources. One accepted limitation: `clear_cache()` isn't coordinated
+against concurrently in-flight downloads from other processes, so avoid
+calling it while other processes may be actively loading kernels from the
+same cache.
+
+### Working offline / when the ESA FTP server is unreachable
+
+A small local cache remembers what each FTP call last returned, so the
+library degrades gracefully instead of hard-failing when there's no network:
+
+* **Pinned versions never need the network twice.** Once a specific version
+  tag (e.g. `version="v462_20260223_001"`) has been fully resolved and
+  downloaded, later calls for the same spacecraft/`mk`/version skip the FTP
+  server entirely — a pinned version tag never changes once published.
+* **`version="latest"` (the default) always tries a live check first** — its
+  whole point is to discover newly published kernels, so it never silently
+  serves stale data while online. Only if the ESA FTP server truly can't be
+  reached (DNS failure, timeout, connection refused, etc.) does it fall back
+  to the last fully-verified local resolution, logging a warning that the
+  result may not reflect the newest kernels.
+* **`sm.metakernels` (the list of available metakernels)** gets the same
+  treatment: cached after each successful listing, reused with a warning if
+  the server can't be reached.
+* **If nothing usable is cached** when the server is unreachable, a clear
+  `ConnectionError` is raised (naming exactly which referenced kernel files
+  are still missing, if a partial cache exists) instead of a raw socket
+  error several layers down.
+
+This is transparent — no configuration needed — and lives alongside the
+regular kernel cache (`<kernels_dir>/.resolution_cache.json`), so
+`clear_cache()` clears it too.
 
 ## Development
 

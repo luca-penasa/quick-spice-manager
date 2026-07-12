@@ -25,6 +25,7 @@ dependencies = [
     "loguru>=0.7.2",
     "spiceypy>=6.0",
     "platformdirs>=4.3.6",
+    "filelock>=3.13.0",
     "pandas>=2.2.3",
     "attrs>=24.2.0",
     "python-dotenv>=1.0.0",

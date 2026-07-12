@@ -5,6 +5,31 @@ Pytest configuration and shared fixtures.
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _isolate_ftp_connection_lock_dir(tmp_path_factory, monkeypatch):
+    """Redirect fixed, non-kernels_dir-scoped cache/lock locations into
+    throwaway temp directories for every test.
+
+    Without this, tests that exercise the real (unmocked) download/list code
+    paths in ``quick_spice_manager.ftp`` would create lock files and cache
+    entries under the real user cache directory
+    (``platformdirs.user_cache_dir(...)``), would contend with any real
+    concurrent process's connection slots, and could pollute/be polluted by
+    real metakernel-listing cache data. (Paths derived from an explicit
+    ``kernels_dir`` argument, like the resolution cache, don't need this --
+    every test already passes a ``tmp_path``-scoped ``kernels_dir``.)
+    """
+    lock_dir = tmp_path_factory.mktemp("ftp-connection-locks")
+    monkeypatch.setattr(
+        "quick_spice_manager.ftp.get_ftp_connection_lock_dir", lambda: lock_dir
+    )
+    listing_cache_dir = tmp_path_factory.mktemp("metakernel-listing-cache")
+    monkeypatch.setattr(
+        "quick_spice_manager.ftp.get_metakernel_listing_cache_dir",
+        lambda: listing_cache_dir,
+    )
+
+
 def pytest_addoption(parser: pytest.Parser) -> None:
     parser.addoption(
         "--integration",

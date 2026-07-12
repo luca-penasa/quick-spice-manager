@@ -7,12 +7,19 @@ network access required.
 
 from __future__ import annotations
 
+import tempfile
 import textwrap
+import threading
+import time
+import uuid
 from pathlib import Path
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, PropertyMock, call, patch
 
+import filelock
 import pytest
 
+from quick_spice_manager import spice_manager as spice_manager_module
+from quick_spice_manager.dirs import get_cache_lock_path
 from quick_spice_manager.spice_manager import SpiceManager, _KERNEL_MAX_LENGTH
 
 
@@ -881,3 +888,405 @@ def test_tour_config_raises_without_planetary_coverage(tmp_path):
     with patch("builtins.__import__", side_effect=mock_import):
         with pytest.raises(ImportError, match="pip install quick-spice-manager\\[planetary-coverage\\]"):
             sm.tour_config
+
+
+# ---------------------------------------------------------------------------
+# Concurrency / multi-process safety
+# ---------------------------------------------------------------------------
+
+
+def test_pool_lock_serializes_concurrent_load_kernels(tmp_path):
+    """Two threads calling load_kernels() concurrently never interleave the
+    kclear()/furnsh() pair — the whole method body is one critical section."""
+    events: list[tuple[int, str]] = []
+    events_lock = threading.Lock()
+
+    def record(kind: str) -> None:
+        with events_lock:
+            events.append((threading.get_ident(), kind))
+
+    def make_side_effect():
+        def _side_effect(*_args, **_kwargs):
+            record("start")
+            time.sleep(0.05)
+            record("end")
+
+        return _side_effect
+
+    sm1 = _make_sm(tmp_path)
+    sm2 = _make_sm(tmp_path)
+
+    with patch("quick_spice_manager.spice_manager.spiceypy") as mock_spice:
+        mock_spice.ktotal.return_value = 1
+        mock_spice.kdata.return_value = ("/kernels/dummy.bsp", "SPK", "file", 0)
+        mock_spice.kclear.side_effect = make_side_effect()
+        mock_spice.furnsh.side_effect = make_side_effect()
+
+        t1 = threading.Thread(target=sm1.load_kernels)
+        t2 = threading.Thread(target=sm2.load_kernels)
+        t1.start()
+        t2.start()
+        t1.join(timeout=5)
+        t2.join(timeout=5)
+
+    assert not t1.is_alive()
+    assert not t2.is_alive()
+
+    # At no point should both threads' kclear/furnsh calls be "in flight"
+    # at the same time — that would mean the lock failed to serialize them.
+    open_idents: set[int] = set()
+    max_concurrent = 0
+    for ident, kind in events:
+        if kind == "start":
+            open_idents.add(ident)
+            max_concurrent = max(max_concurrent, len(open_idents))
+        else:
+            open_idents.discard(ident)
+    assert max_concurrent == 1
+
+
+def test_load_kernels_reentrant_call_does_not_deadlock(tmp_path):
+    """load_kernels() calling self.unload_kernels() internally while already
+    holding the pool lock must not deadlock (requires RLock, not Lock)."""
+    sm = _make_sm(tmp_path)
+
+    def run() -> None:
+        with patch("quick_spice_manager.spice_manager.spiceypy") as mock_spice:
+            mock_spice.ktotal.return_value = 1
+            mock_spice.kdata.return_value = ("/kernels/dummy.bsp", "SPK", "file", 0)
+            sm.load_kernels()
+            sm.load_kernels()  # already loaded -> internally calls unload_kernels()
+
+    t = threading.Thread(target=run)
+    t.start()
+    t.join(timeout=5)
+
+    assert not t.is_alive()  # would still be alive if the lock deadlocked
+
+
+def test_resolved_mk_concurrent_access_creates_single_temp_file(tmp_path):
+    """Concurrent first-time access to .resolved_mk on one instance must not
+    leak an orphaned localized temp file or hand out two different paths."""
+    # Unique stem so this test's temp file can't be confused with leftovers
+    # from other tests (_localize_metakernel writes into the system temp
+    # dir, not tmp_path).
+    unique_name = f"concurrency_test_{uuid.uuid4().hex}"
+    mk = _make_local_mk(tmp_path, content=_MINIMAL_MK)
+    mk = mk.rename(tmp_path / f"{unique_name}.tm")
+    sm = _make_sm(tmp_path, mk=mk)
+
+    original_localize = sm._localize_metakernel
+
+    def slow_localize(mk_path):
+        time.sleep(0.1)
+        return original_localize(mk_path)
+
+    results: list[Path] = []
+    results_lock = threading.Lock()
+
+    def worker() -> None:
+        p = sm.resolved_mk
+        with results_lock:
+            results.append(p)
+
+    with patch.object(SpiceManager, "_localize_metakernel", side_effect=slow_localize):
+        threads = [threading.Thread(target=worker) for _ in range(3)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=5)
+
+    assert all(not t.is_alive() for t in threads)
+    assert len(results) == 3
+    assert len(set(results)) == 1  # every thread got the same resolved path
+
+    # _localize_metakernel() writes into the system temp dir (not tmp_path);
+    # only one such file should exist for this mk stem — a second one would
+    # indicate a leaked orphan from a lost check-and-set race.
+    localized_files = list(
+        Path(tempfile.gettempdir()).glob(f"{mk.stem}-localized-*.tm")
+    )
+    assert len(localized_files) == 1  # no orphaned duplicate temp file
+
+    sm._localized_mk_path.unlink(missing_ok=True)
+
+
+def test_context_manager_blocks_second_thread_for_whole_duration(tmp_path):
+    """with sm: holds the pool lock for the entire block, so a second
+    thread's with-block cannot start until the first one fully exits."""
+    mk = _make_local_mk(tmp_path)
+    sm1 = _make_sm(tmp_path, mk=mk)
+    sm2 = _make_sm(tmp_path, mk=mk)
+
+    a_entered = threading.Event()
+    a_may_exit = threading.Event()
+    b_entered = threading.Event()
+
+    with patch("quick_spice_manager.spice_manager.spiceypy") as mock_spice:
+        mock_spice.ktotal.return_value = 0  # empty pool, no snapshot/kdata needed
+
+        def thread_a() -> None:
+            with sm1:
+                a_entered.set()
+                a_may_exit.wait(timeout=5)
+
+        def thread_b() -> None:
+            a_entered.wait(timeout=5)
+            with sm2:
+                b_entered.set()
+
+        ta = threading.Thread(target=thread_a)
+        tb = threading.Thread(target=thread_b)
+        ta.start()
+        assert a_entered.wait(timeout=5)
+        tb.start()
+
+        # Thread A still holds the lock (hasn't hit a_may_exit yet), so
+        # thread B must still be blocked trying to enter its own `with` block.
+        time.sleep(0.2)
+        assert not b_entered.is_set()
+
+        a_may_exit.set()
+        ta.join(timeout=5)
+        tb.join(timeout=5)
+
+    assert not ta.is_alive()
+    assert not tb.is_alive()
+    assert b_entered.is_set()
+
+
+def test_get_cache_lock_path_outside_cache_dir(tmp_path):
+    """The cache lock file lives in the cache dir's parent, never inside it,
+    so shutil.rmtree(cache_dir) in clear_cache() can never delete it."""
+    cache_dir = tmp_path / "kernels" / "juice"
+    lock_path = get_cache_lock_path(cache_dir)
+
+    assert lock_path.parent == cache_dir.parent
+    assert lock_path.name == ".juice.cache.lock"
+
+
+def test_clear_cache_lock_survives_rmtree(tmp_path):
+    """clear_cache() must leave its own lock file usable after returning —
+    i.e. it wasn't nested inside the directory tree it just rmtree'd."""
+    cache_dir = tmp_path / "cache" / "juice"
+    cache_dir.mkdir(parents=True)
+    (cache_dir / "dummy_kernel.bsp").write_bytes(b"data")
+
+    sm = _make_sm(tmp_path)
+
+    with patch.object(
+        type(sm),
+        "user_kernels_cache_directory",
+        new_callable=PropertyMock,
+        return_value=cache_dir,
+    ):
+        sm.clear_cache()
+
+    assert cache_dir.exists()
+    assert list(cache_dir.iterdir()) == []
+
+    lock_path = get_cache_lock_path(cache_dir)
+    lock = filelock.FileLock(str(lock_path), timeout=1)
+    lock.acquire()  # would raise Timeout if clear_cache() left it held
+    lock.release()
+
+
+def test_load_kernels_uses_furnish_slot(tmp_path):
+    """load_kernels() acquires a cross-process furnish slot for its
+    kernels_dir before touching the pool."""
+    import contextlib
+
+    mk = _make_local_mk(tmp_path)
+    sm = _make_sm(tmp_path, mk=mk)
+
+    with (
+        patch.object(
+            spice_manager_module, "_furnish_slot",
+            return_value=contextlib.nullcontext(),
+        ) as mock_slot,
+        patch("quick_spice_manager.spice_manager.spiceypy") as mock_spice,
+    ):
+        mock_spice.ktotal.return_value = 1
+        mock_spice.kdata.return_value = ("/kernels/dummy.bsp", "SPK", "file", 0)
+        sm.load_kernels()
+
+    mock_slot.assert_called_once_with(sm._kernels_dir)
+
+
+def test_furnish_slot_bounds_concurrent_managers(tmp_path):
+    """No more than _MAX_CONCURRENT_FURNISH_SLOTS managers can be "inside"
+    _furnish_slot() for the same kernels_dir at once; extras wait their turn."""
+    max_slots = spice_manager_module._MAX_CONCURRENT_FURNISH_SLOTS
+    release = threading.Event()
+    concurrent_count = 0
+    max_concurrent_seen = 0
+    count_lock = threading.Lock()
+
+    def hold_slot():
+        nonlocal concurrent_count, max_concurrent_seen
+        with spice_manager_module._furnish_slot(tmp_path):
+            with count_lock:
+                concurrent_count += 1
+                max_concurrent_seen = max(max_concurrent_seen, concurrent_count)
+            release.wait(timeout=5)
+            with count_lock:
+                concurrent_count -= 1
+
+    threads = [threading.Thread(target=hold_slot) for _ in range(max_slots + 2)]
+    for t in threads:
+        t.start()
+
+    time.sleep(0.3)  # let every thread attempt acquisition
+    assert concurrent_count == max_slots  # extras are waiting, not "inside"
+
+    release.set()
+    for t in threads:
+        t.join(timeout=5)
+
+    assert all(not t.is_alive() for t in threads)
+    assert max_concurrent_seen == max_slots
+
+
+def test_furnish_slot_scoped_per_kernels_dir(tmp_path):
+    """Two different kernels_dir paths get independent furnish-slot pools --
+    unrelated missions never wait on each other."""
+    max_slots = spice_manager_module._MAX_CONCURRENT_FURNISH_SLOTS
+    dir_a = tmp_path / "juice"
+    dir_b = tmp_path / "rosetta"
+
+    held = [spice_manager_module._furnish_slot(dir_a) for _ in range(max_slots)]
+    for cm in held:
+        cm.__enter__()
+    try:
+        # dir_a is fully saturated, but dir_b's pool is untouched and free.
+        with spice_manager_module._furnish_slot(dir_b):
+            pass
+    finally:
+        for cm in held:
+            cm.__exit__(None, None, None)
+
+
+# ---------------------------------------------------------------------------
+# kernel_provenance
+# ---------------------------------------------------------------------------
+
+
+def test_kernel_provenance_manager_reports_metakernel_and_kernels(tmp_path):
+    k1 = "/kernels/juice_spk.bsp"
+    sm, _ = _sm_loaded(tmp_path, [k1])
+
+    info = sm.kernel_provenance()
+
+    assert info["metakernel"] == sm._mk
+    assert info["spacecraft"] == "JUICE"
+    assert info["version"] == "latest"
+    assert info["resolved_at"] is not None
+    assert info["all_kernels"] == [k1]
+    assert info["extra_kernels"] == []
+
+
+def test_kernel_provenance_manager_reports_added_extra_kernels(tmp_path):
+    k1 = "/kernels/juice_spk.bsp"
+    extra = tmp_path / "custom.bc"
+    extra.write_text("placeholder")
+    sm, _ = _sm_loaded(tmp_path, [k1])
+
+    with patch("quick_spice_manager.spice_manager.spiceypy"):
+        sm.add_kernel(extra)
+
+    info = sm.kernel_provenance()
+
+    assert info["extra_kernels"] == [str(extra.resolve())]
+    assert info["all_kernels"] == sorted([k1, str(extra.resolve())])
+
+
+def test_kernel_provenance_manager_raises_before_load(tmp_path):
+    sm = _make_sm(tmp_path)
+    with pytest.raises(RuntimeError, match=r"load_kernels\(\)"):
+        sm.kernel_provenance()
+
+
+def test_kernel_provenance_manager_raises_when_superseded(tmp_path):
+    sm_juice, _ = _sm_loaded(tmp_path, ["/kernels/juice_spk.bsp"])
+    _sm_loaded(tmp_path, ["/kernels/ros_spk.bsp"])  # supersedes juice
+    with pytest.raises(RuntimeError, match="no longer the active pool owner"):
+        sm_juice.kernel_provenance()
+
+
+def test_kernel_provenance_invalid_source_raises(tmp_path):
+    sm, _ = _sm_loaded(tmp_path, ["/kernels/juice_spk.bsp"])
+    with pytest.raises(ValueError, match="source must be"):
+        sm.kernel_provenance(source="bogus")
+
+
+def _write_pool_metakernel(tmp_path, kernels_dir, relative_kernels):
+    """Write a real, minimal, already-"localized"-style .tm file so
+    _kernels_referenced_by_metakernel() can parse it independent of any
+    manager -- exactly like the pool mode is meant to work."""
+    tm = tmp_path / "pool_meta.tm"
+    kernels_block = "\n".join(f"    '$KERNELS/{k}'" for k in relative_kernels)
+    tm.write_text(
+        textwrap.dedent(f"""\
+            KPL/MK
+
+            \\begindata
+            PATH_VALUES = ( '{kernels_dir}' )
+            PATH_SYMBOLS = ( 'KERNELS' )
+            KERNELS_TO_LOAD = (
+            {kernels_block}
+            )
+            \\begintext
+        """),
+        encoding="utf-8",
+    )
+    return tm
+
+
+def test_kernel_provenance_pool_reports_metakernel_and_extra_kernels(tmp_path):
+    kernels_dir = tmp_path / "kernels" / "juice"
+    tm = _write_pool_metakernel(tmp_path, kernels_dir, ["fk/juice_v45.tf"])
+
+    metakernel_kernel = str(kernels_dir / "fk/juice_v45.tf")
+    extra_kernel = "/extra/custom.bc"
+
+    sm = _make_sm(tmp_path)
+    with patch("quick_spice_manager.spice_manager.spiceypy") as mock_spice:
+        mock_spice.ktotal.return_value = 3
+        mock_spice.kdata.side_effect = [
+            (str(tm), "META", "file", 0),
+            (metakernel_kernel, "TEXT", "file", 1),
+            (extra_kernel, "CK", "file", 2),
+        ]
+        info = sm.kernel_provenance(source="pool")
+
+    assert info["metakernel"] == str(tm)
+    assert info["spacecraft"] is None
+    assert info["mk"] is None
+    assert info["version"] is None
+    assert info["resolved_at"] is None
+    assert info["all_kernels"] == sorted([metakernel_kernel, extra_kernel])
+    assert info["extra_kernels"] == [extra_kernel]
+
+
+def test_kernel_provenance_pool_no_metakernel_returns_none(tmp_path):
+    sm = _make_sm(tmp_path)
+    with patch("quick_spice_manager.spice_manager.spiceypy") as mock_spice:
+        mock_spice.ktotal.return_value = 1
+        mock_spice.kdata.return_value = ("/kernels/juice_spk.bsp", "SPK", "file", 0)
+        info = sm.kernel_provenance(source="pool")
+
+    assert info["metakernel"] is None
+    assert info["all_kernels"] == ["/kernels/juice_spk.bsp"]
+    assert info["extra_kernels"] == ["/kernels/juice_spk.bsp"]
+
+
+def test_kernel_provenance_pool_works_without_loading(tmp_path):
+    """source='pool' needs no load_kernels() call at all -- pure pool inspection."""
+    sm = _make_sm(tmp_path)
+    with patch("quick_spice_manager.spice_manager.spiceypy") as mock_spice:
+        mock_spice.ktotal.return_value = 0
+        info = sm.kernel_provenance(source="pool")
+
+    assert info["metakernel"] is None
+    assert info["all_kernels"] == []
+    assert info["extra_kernels"] == []
