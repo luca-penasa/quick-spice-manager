@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## Unreleased
 
+## 0.2.0 - 2026-07-13
+
 ### Added
 
 - `kernel_provenance()`: reports the minimal kernel set needed to reproduce the currently active kernel set (e.g. for PDS4 label generation) — the resolved metakernel itself (real filename, with the SKD version baked in when pinned) plus only the kernels added on top of it (e.g. via `add_kernel()`). Pass `source="pool"` to inspect the live SPICE pool directly instead of this manager's own bookkeeping.
