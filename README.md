@@ -136,6 +136,18 @@ print(sm.is_dirty)    # True if kernels were added/removed since load_kernels()
 sm.clean_pool()       # unload extras and re-furnish missing kernels
 ```
 
+### Inspecting the current configuration
+
+`sm.config` returns a pandas DataFrame — spacecraft, version, the resolved
+metakernel path, and kernels directory — resolved entirely from this
+manager's own state. Unlike `tour_config` below, it does **not** require the
+`planetary-coverage` extra and doesn't report target/instrument, since those
+belong to `TourConfig`, not this manager:
+
+```python
+print(sm.config)
+```
+
 ### Documenting which kernels were used
 
 `kernel_provenance()` reports the minimum information needed to reproduce
@@ -189,8 +201,8 @@ sm.load_kernels()
 ### planetary-coverage integration
 
 `QuickSpiceManager` itself only handles SPICE kernels — it carries no
-target/instrument/geometry state of its own. `tour_config`/`config` are thin,
-on-demand bridges to `planetary_coverage.TourConfig` for downstream analysis.
+target/instrument/geometry state of its own. `get_tour_config()` is a thin,
+on-demand bridge to `planetary_coverage.TourConfig` for downstream analysis.
 Requires the optional `planetary-coverage` extra:
 
 ```sh
@@ -200,18 +212,15 @@ pip install quick-spice-manager[planetary-coverage]
 ```python
 sm = QuickSpiceManager(spacecraft="JUICE", mk="plan")
 
-# Property form: builds a TourConfig with the default target='Jupiter',
-# instrument='JANUS'.
-tc = sm.tour_config
+# Builds a TourConfig with the given target/instrument.
+tc = sm.get_tour_config(target="Jupiter", instrument="JANUS")
 print(tc.coverage)
-
-# For a different target/instrument, call get_tour_config() directly.
-tc = sm.get_tour_config(target="Mars", instrument="SOME_INSTRUMENT")
-
-# Returns a pandas DataFrame — renders as a table in Jupyter. get_config()
-# takes the same target/instrument parameters as get_tour_config().
-print(sm.config)
 ```
+
+> **Deprecated:** the old `tour_config` *property* (no target/instrument
+> control, always `target='Jupiter'`/`instrument='JANUS'`) still works for
+> backward compatibility, but emits a `DeprecationWarning` — use
+> `get_tour_config()` instead.
 
 ### Environment variable overrides
 

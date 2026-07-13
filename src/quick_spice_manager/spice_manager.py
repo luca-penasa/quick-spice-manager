@@ -10,6 +10,7 @@ import re
 import shutil
 import threading
 import time
+import warnings
 import weakref
 from collections.abc import Iterable
 from datetime import datetime, timezone
@@ -1006,14 +1007,22 @@ class QuickSpiceManager:
     def tour_config(self):
         """``TourConfig`` built with the default target/instrument.
 
-        Convenience property form of :meth:`get_tour_config` using
-        ``target='Jupiter'``, ``instrument='JANUS'``. Call
-        :meth:`get_tour_config` directly for a different target/instrument.
+        .. deprecated::
+            Kept only for backward compatibility with code that accesses
+            ``.tour_config`` as a plain attribute. Emits a
+            ``DeprecationWarning`` -- use :meth:`get_tour_config` instead
+            (same defaults, called explicitly: ``sm.get_tour_config()``).
 
         Requires the ``planetary-coverage`` optional extra::
 
             pip install quick-spice-manager[planetary-coverage]
         """
+        warnings.warn(
+            "QuickSpiceManager.tour_config (property) is deprecated and will "
+            "be removed in a future release. Use get_tour_config() instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         return self.get_tour_config()
 
     @property
@@ -1167,49 +1176,38 @@ class QuickSpiceManager:
             f"</div>"
         )
 
-    def get_config(
-        self,
-        target: str = "Jupiter",
-        instrument: str | None = "JANUS",
-    ) -> pd.DataFrame:
+    @property
+    def config(self) -> pd.DataFrame:
         """
         Get the current configuration as a pandas DataFrame for display in
-        Jupyter notebooks. Builds a :meth:`get_tour_config` internally, so
-        requires the ``planetary-coverage`` optional extra. Call this
-        directly for a target/instrument other than the :attr:`config`
-        property's defaults.
+        Jupyter notebooks.
+
+        Resolved entirely from this manager's own state (triggering the
+        same download-if-needed resolution as :attr:`resolved_mk` to report
+        the real metakernel path) -- unlike :attr:`tour_config`, this does
+        not build a ``TourConfig`` and does not require the
+        ``planetary-coverage`` optional extra. Target/instrument are
+        deliberately not included here: they're ``TourConfig``'s concerns,
+        not this manager's -- see :meth:`get_tour_config`.
         """
-        tour = self.get_tour_config(target=target, instrument=instrument)
+        resolved = self._resolve_metakernel()
         table = pd.DataFrame()
         table["key"] = [
             "spacecraft",
-            "skd_version",
-            "target",
-            "instrument",
+            "version",
             "metakernel",
             "kernels_dir",
         ]
-        table["value"] = [
-            tour.spacecraft,
-            tour.skd_version,
-            tour.target,
-            tour.instrument,
-            tour.mk,
+        values: list[Any] = [
+            self._spacecraft,
+            self._version,
+            str(resolved),
             self._kernels_dir,
         ]
+        table["value"] = values
 
         table.set_index("key", inplace=True)
         return table
-
-    @property
-    def config(self) -> pd.DataFrame:
-        """Configuration DataFrame built with the default target/instrument.
-
-        Convenience property form of :meth:`get_config` using
-        ``target='Jupiter'``, ``instrument='JANUS'``. Call :meth:`get_config`
-        directly for a different target/instrument.
-        """
-        return self.get_config()
 
 
 

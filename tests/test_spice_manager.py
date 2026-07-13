@@ -12,6 +12,7 @@ import textwrap
 import threading
 import time
 import uuid
+import warnings
 from pathlib import Path
 from unittest.mock import MagicMock, PropertyMock, call, patch
 
@@ -937,26 +938,76 @@ def test_tour_config_property_delegates_to_get_tour_config_defaults(tmp_path):
     sm = _make_sm(tmp_path)
     sentinel = object()
 
-    with patch.object(
-        SpiceManager, "get_tour_config", return_value=sentinel,
-    ) as mock_get:
+    with (
+        patch.object(
+            SpiceManager, "get_tour_config", return_value=sentinel,
+        ) as mock_get,
+        pytest.warns(DeprecationWarning, match="get_tour_config"),
+    ):
         result = sm.tour_config
 
     assert result is sentinel
     mock_get.assert_called_once_with()
 
 
-def test_config_property_delegates_to_get_config_defaults(tmp_path):
-    """The config property is a backward-compatible convenience form of
-    get_config() using the documented defaults."""
+def test_tour_config_property_emits_deprecation_warning(tmp_path):
+    """Accessing the tour_config property must emit a DeprecationWarning
+    nudging callers towards get_tour_config(), even though it still works."""
     sm = _make_sm(tmp_path)
-    sentinel = object()
 
-    with patch.object(SpiceManager, "get_config", return_value=sentinel) as mock_get:
-        result = sm.config
+    with (
+        patch.object(SpiceManager, "get_tour_config", return_value=object()),
+        pytest.warns(DeprecationWarning) as record,
+    ):
+        sm.tour_config
 
-    assert result is sentinel
-    mock_get.assert_called_once_with()
+    assert len(record) == 1
+    assert "get_tour_config" in str(record[0].message)
+    assert "tour_config" in str(record[0].message)
+
+
+def test_get_tour_config_does_not_warn(tmp_path):
+    """Calling get_tour_config() directly (the non-deprecated path) must not
+    itself emit the tour_config-property deprecation warning."""
+    mk = _make_local_mk(tmp_path)
+    sm = _make_sm(tmp_path, mk=mk)
+
+    import builtins
+    real_import = builtins.__import__
+
+    def mock_import(name, *args, **kwargs):
+        if name == "planetary_coverage":
+            raise ImportError("No module named 'planetary_coverage'")
+        return real_import(name, *args, **kwargs)
+
+    with patch("builtins.__import__", side_effect=mock_import):
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")  # any warning here fails the test
+            with pytest.raises(ImportError):
+                sm.get_tour_config()
+
+
+def test_config_resolves_without_tour_config_or_planetary_coverage(tmp_path):
+    """config resolves spacecraft/version/metakernel/kernels_dir directly
+    from this manager's own state -- it must not build a TourConfig (and so
+    needs no planetary_coverage), and target/instrument (TourConfig's
+    concerns, not this manager's) must not appear in the result."""
+    mk = _make_local_mk(tmp_path)
+    sm = _make_sm(tmp_path, mk=mk, spacecraft="JUICE", version="latest")
+
+    with patch.object(
+        SpiceManager,
+        "get_tour_config",
+        side_effect=AssertionError("config must not call get_tour_config"),
+    ):
+        table = sm.config
+
+    assert table.loc["spacecraft", "value"] == "JUICE"
+    assert table.loc["version", "value"] == "latest"
+    assert table.loc["metakernel", "value"] == str(mk)
+    assert table.loc["kernels_dir", "value"] == tmp_path
+    assert "target" not in table.index
+    assert "instrument" not in table.index
 
 
 # ---------------------------------------------------------------------------

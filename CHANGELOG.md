@@ -6,6 +6,36 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## Unreleased
 
+### Added
+
+- `kernel_provenance()`: reports the minimal kernel set needed to reproduce the currently active kernel set (e.g. for PDS4 label generation) — the resolved metakernel itself (real filename, with the SKD version baked in when pinned) plus only the kernels added on top of it (e.g. via `add_kernel()`). Pass `source="pool"` to inspect the live SPICE pool directly instead of this manager's own bookkeeping.
+- `sm.config`: a pandas DataFrame (spacecraft, version, resolved metakernel path, kernels directory) resolved directly from the manager's own state. Unlike `tour_config`, it does not require the `planetary-coverage` extra and does not report target/instrument.
+- `get_tour_config()`: explicit method taking `target`/`instrument` as call-time parameters, replacing stored target/instrument state on the manager.
+- Offline resilience: a small on-disk resolution cache lets pinned SKD versions skip the network entirely once fully downloaded, and lets `version="latest"` fall back to the last verified local resolution (with a warning) when ESA's FTP server is unreachable.
+- Multi-process/thread safety: an in-process re-entrant lock serializes all CSPICE pool operations (`with QuickSpiceManager(...)` holds it for the whole load-use-unload lifecycle); kernel downloads use atomic temp-file+rename with per-file cross-process locks; a bounded pool of FTP connection slots and per-`kernels_dir` furnish slots keep bursts of concurrent managers/processes from overwhelming ESA's FTP server or each other.
+- `QuickSpiceManager` is now the primary class name. `SpiceManager` remains available as a deprecated alias (emits a `DeprecationWarning`).
+- The kernel cache directory is now dedicated to this package instead of being shared with `planetary-coverage`'s cache.
+
+### Changed
+
+- **`resolved_mk` is now a self-resolving property** instead of a plain attribute only ever set as a side effect of `load_kernels()`. Simply accessing `sm.resolved_mk` now triggers FTP download/localization on demand and returns a ready-to-furnish path — without loading anything into the SPICE pool. The result is cached on the instance.
+- `load_kernels()` now returns the localized temporary metakernel path (the same path exposed by `resolved_mk`) rather than the original, non-temp metakernel path.
+- `download_kernels=False` is now actually honored: resolution is satisfied entirely from the local cache, raising `FileNotFoundError` if nothing complete is cached, instead of silently reaching the network anyway.
+- Changing `spacecraft`/`version`/`mk`/`kernels_dir` on an existing manager instance now invalidates any already-resolved metakernel, forcing re-resolution on next access.
+
+### Deprecated
+
+- `tour_config` (property) is deprecated in favor of `get_tour_config()`. It still works with the same defaults (`target='Jupiter'`, `instrument='JANUS'`) for backward compatibility, but emits a `DeprecationWarning`.
+
+### Removed
+
+- `_target`/`_instrument`/`_kernels` stored fields, `coverage_table()`, and the `metakernel` property — redundant with `resolved_mk`, and required building a whole `TourConfig` just to read one path.
+- Orphaned, unused `utils.py` (imported `planetary_coverage` unconditionally, crashing on import without the optional dependency; its own docstring admitted the functions were buggy).
+
+### Fixed
+
+- Pinning an SKD version that can't be found on the FTP server now raises a clear `FileNotFoundError` (naming the version and where it looked) instead of silently falling back to the unversioned metakernel.
+
 ## 0.1.3 - 2026-04-23
 
 ## 0.1.2 - 2026-03-11
