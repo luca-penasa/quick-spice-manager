@@ -115,6 +115,35 @@ def _furnish_slot(kernels_dir: Path) -> "AbstractContextManager[None]":
 # itself makes (this library never writes more than one PATH_VALUES entry).
 _PATH_VALUES_RE = re.compile(r"PATH_VALUES\s*=\s*\(\s*'([^']+)'\s*\)")
 
+# ESA JUICE metakernels declare their own SPICE Kernel Dataset version and a
+# unique identifier as \begindata keywords, e.g.:
+#   SKD_VERSION = 'v471_20260709_002'
+#   MK_IDENTIFIER = 'juice_plan_v471_20260709_002'
+# Older metakernels may not carry these -- treated as absent, not an error.
+_SKD_VERSION_RE = re.compile(r"SKD_VERSION\s*=\s*'([^']+)'")
+_MK_IDENTIFIER_RE = re.compile(r"MK_IDENTIFIER\s*=\s*'([^']+)'")
+
+
+def _read_mk_keywords(mk_path: Path | str | None) -> tuple[str | None, str | None]:
+    """Read the ``SKD_VERSION`` / ``MK_IDENTIFIER`` keywords a metakernel
+    declares about itself, if present.
+
+    Returns ``(skd_version, mk_identifier)``, either or both ``None`` if
+    *mk_path* is ``None``, unreadable, or doesn't declare the keyword.
+    """
+    if not mk_path:
+        return None, None
+    try:
+        content = Path(mk_path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None, None
+    skd_match = _SKD_VERSION_RE.search(content)
+    id_match = _MK_IDENTIFIER_RE.search(content)
+    return (
+        skd_match.group(1) if skd_match else None,
+        id_match.group(1) if id_match else None,
+    )
+
 
 def _kernels_referenced_by_metakernel(tm_path: Path) -> frozenset[str]:
     """Return the absolute paths of every non-META kernel *tm_path* itself
@@ -1076,6 +1105,7 @@ class QuickSpiceManager:
     def _repr_html_(self) -> str:
         """Rich HTML representation for Jupyter notebooks."""
         # --- configuration rows ---
+        skd_version, mk_identifier = _read_mk_keywords(self._resolved_mk_path)
         cfg_rows = "".join(
             f"<tr><td style='padding:3px 8px;font-weight:bold;white-space:nowrap'>{k}</td>"
             f"<td style='padding:3px 8px;font-family:monospace'>{v}</td></tr>"
@@ -1084,6 +1114,8 @@ class QuickSpiceManager:
                 ("metakernel", self._mk),
                 ("kernels_dir", self._kernels_dir),
                 ("version", self._version),
+                ("skd_version", skd_version or "&mdash;"),
+                ("mk_identifier", mk_identifier or "&mdash;"),
                 ("exclusive", self._exclusive),
             ]
         )
@@ -1191,16 +1223,21 @@ class QuickSpiceManager:
         not this manager's -- see :meth:`get_tour_config`.
         """
         resolved = self._resolve_metakernel()
+        skd_version, mk_identifier = _read_mk_keywords(resolved)
         table = pd.DataFrame()
         table["key"] = [
             "spacecraft",
             "version",
+            "skd_version",
+            "mk_identifier",
             "metakernel",
             "kernels_dir",
         ]
         values: list[Any] = [
             self._spacecraft,
             self._version,
+            skd_version,
+            mk_identifier,
             str(resolved),
             self._kernels_dir,
         ]

@@ -1007,6 +1007,49 @@ def test_config_resolves_without_tour_config_or_planetary_coverage(tmp_path):
     assert table.loc["metakernel", "value"] == str(mk)
     assert table.loc["kernels_dir", "value"] == tmp_path
     assert "target" not in table.index
+    assert table.loc["skd_version", "value"] is None
+    assert table.loc["mk_identifier", "value"] is None
+
+
+_MK_WITH_SKD_KEYWORDS = textwrap.dedent("""\
+    KPL/MK
+
+    \\begindata
+    PATH_VALUES = ( '/original/kernels' )
+    PATH_SYMBOLS = ( 'KERNELS' )
+    KERNELS_TO_LOAD = (
+        '$KERNELS/fk/juice_v01.tf'
+    )
+    \\begintext
+
+       SPICE Kernel Dataset Version
+       --------------------------------------------------------------
+
+       \\begindata
+
+          SKD_VERSION = 'v471_20260709_002'
+
+       \\begintext
+
+       \\begindata
+
+          MK_IDENTIFIER = 'juice_plan_v471_20260709_002'
+
+       \\begintext
+""")
+
+
+def test_config_reports_skd_version_and_mk_identifier_when_present(tmp_path):
+    """When the metakernel declares SKD_VERSION / MK_IDENTIFIER keywords about
+    itself (as ESA JUICE metakernels do), config surfaces them as their own
+    rows rather than making callers parse the metakernel text themselves."""
+    mk = _make_local_mk(tmp_path, content=_MK_WITH_SKD_KEYWORDS)
+    sm = _make_sm(tmp_path, mk=mk)
+
+    table = sm.config
+
+    assert table.loc["skd_version", "value"] == "v471_20260709_002"
+    assert table.loc["mk_identifier", "value"] == "juice_plan_v471_20260709_002"
     assert "instrument" not in table.index
 
 
