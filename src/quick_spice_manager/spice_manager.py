@@ -5,6 +5,7 @@ Provides standalone kernel loading, context manager support for temporary
 kernel pools, and optional integration with planetary_coverage.TourConfig.
 """
 
+import atexit
 import os
 import re
 import shutil
@@ -16,7 +17,7 @@ from collections.abc import Iterable
 from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import filelock
 import pandas as pd
@@ -25,6 +26,7 @@ from attrs import define, field
 from attrs import setters as _setters
 from dotenv import load_dotenv
 from loguru import logger as log
+from spiceypy.utils.exceptions import NotFoundError
 
 from .dirs import (
     get_cache_lock_path,
@@ -54,10 +56,8 @@ def _invalidate_resolved_mk(instance: "QuickSpiceManager", _attrib, new_value): 
         # spiceypy.unload() needs to re-read the file to know what to unload.
         loaded = getattr(instance, "_loaded_mk_path", None)
         if cached != loaded:
-            try:
-                cached.unlink(missing_ok=True)
-            except OSError:
-                pass
+            # ...nor if it was furnished by hand (resolved_mk + furnsh).
+            _delete_localized_if_unused(cached)
     # The real resolved identity is stale too -- it no longer corresponds to
     # the (now-changed) configuration.
     object.__setattr__(instance, "_resolved_mk_path", None)
@@ -110,10 +110,193 @@ def _furnish_slot(kernels_dir: Path) -> "AbstractContextManager[None]":
     )
 
 
-# Matches the PATH_VALUES rewritten by _localize_metakernel() -- a single
-# quoted path, same simple single-value assumption _localize_metakernel
-# itself makes (this library never writes more than one PATH_VALUES entry).
-_PATH_VALUES_RE = re.compile(r"PATH_VALUES\s*=\s*\(\s*'([^']+)'\s*\)")
+# Matches a whole PATH_VALUES = ( ... ) assignment; group 1 is the inside of
+# the parentheses: one or more quoted strings (which may contain ')'),
+# possibly comma-separated and '+'-continued.
+_PATH_VALUES_RE = re.compile(r"PATH_VALUES\s*=\s*\(((?:[\s,]*'[^']*')+)[\s,]*\)")
+_QUOTED_RE = re.compile(r"'([^']*)'")
+
+# NAIF text-kernel limits: one quoted string holds at most 80 characters
+# (longer values are silently truncated) and one line at most 132. A longer
+# value is written as several strings, each but the last ending with the '+'
+# continuation marker; furnsh() joins them in PATH_VALUES and KERNELS_TO_LOAD.
+_MAX_STRING_LENGTH = 80
+_CONTINUATION_CHUNK = 78
+
+
+def _split_string_value(value: str) -> list[str]:
+    """Split *value* into '+'-continued chunks that fit a text-kernel string.
+
+    A value that already fits is returned unchanged, as a single chunk.
+    """
+    if len(value) <= _MAX_STRING_LENGTH:
+        return [value]
+    n = _CONTINUATION_CHUNK
+    return [
+        value[i : i + n] + ("+" if i + n < len(value) else "")
+        for i in range(0, len(value), n)
+    ]
+
+
+def _quoted_lines(value: str, indent: str) -> list[str]:
+    """*value* as one or more quoted, '+'-continued lines."""
+    return [f"{indent}'{chunk}'" for chunk in _split_string_value(value)]
+
+
+def _join_continued(strings: list[str]) -> list[str]:
+    """Inverse of :func:`_split_string_value` over a list of raw strings."""
+    values: list[str] = []
+    pending = ""
+    for s in strings:
+        if s.rstrip().endswith("+"):
+            pending += s.rstrip()[:-1]
+        else:
+            values.append(pending + s)
+            pending = ""
+    if pending:
+        values.append(pending)
+    return values
+
+
+def _read_path_values(content: str) -> list[str] | None:
+    """The values of the first ``PATH_VALUES`` assignment in *content*, with
+    '+' continuations joined, or ``None`` if there is none."""
+    match = _PATH_VALUES_RE.search(content)
+    if match is None:
+        return None
+    return _join_continued(_QUOTED_RE.findall(match.group(1)))
+
+
+def _kernels_dir_from_metakernel(mk_path: Path) -> Path | None:
+    """The kernels directory a local metakernel itself declares.
+
+    That is its single ``PATH_VALUES`` entry, resolved against the
+    metakernel's own folder when relative (ESA metakernels use ``'..'``,
+    i.e. ``mk/..``). ``None`` if the file can't be read or doesn't declare
+    exactly one ``PATH_VALUES`` entry.
+    """
+    try:
+        content = mk_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    values = _read_path_values(content)
+    if not values or len(values) != 1:
+        return None
+    path = Path(values[0])
+    if not path.is_absolute():
+        path = mk_path.parent / path
+    return path.resolve()
+
+
+class _LocalizedMetakernel(NamedTuple):
+    """What a localized temp copy stands for -- see :data:`_localized_metakernels`."""
+
+    source: Path
+    kernels_dir: Path
+    kernels: frozenset[str]
+
+
+# Every localized temp copy this process has written and not yet deleted,
+# keyed by its path, mapped to the real metakernel it was made from.
+# kernel_provenance(source="pool") and snapshot_pool() find the pool's META
+# entry here, so they can report the real metakernel without reading the
+# temp file. The files themselves are deleted by unload_kernels(), by a
+# manager's __del__ if they're not in the pool, or at interpreter exit.
+_localized_metakernels: dict[str, _LocalizedMetakernel] = {}
+# Copies (by registry key) whose manager was collected while they were in the
+# pool; deleted by _sweep_orphaned_localized() once they no longer are.
+_orphaned_localized: dict[str, Path] = {}
+_localized_lock = threading.Lock()
+
+
+def _registry_key(path: Path | str) -> str:
+    return os.path.normcase(os.path.abspath(path))
+
+
+def _lookup_localized(path: Path | str) -> _LocalizedMetakernel | None:
+    with _localized_lock:
+        return _localized_metakernels.get(_registry_key(path))
+
+
+def _is_furnished(path: Path) -> bool:
+    """Whether *path* is loaded in the pool (one ``kinfo`` lookup, so it's
+    cheap and safe to call from ``__del__``)."""
+    try:
+        spiceypy.kinfo(path.as_posix())
+    except NotFoundError:
+        if path.as_posix() == str(path):
+            return False
+        try:  # furnished under its native (non-posix) spelling
+            spiceypy.kinfo(str(path))
+        except NotFoundError:
+            return False
+    return True
+
+
+def _delete_localized(path: Path) -> None:
+    with _localized_lock:
+        _localized_metakernels.pop(_registry_key(path), None)
+        _orphaned_localized.pop(_registry_key(path), None)
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        log.warning(f"Could not delete temp metakernel file {path}")
+
+
+def _delete_localized_if_unused(path: Path, *, orphan: bool = False) -> None:
+    """Delete a localized temp copy unless it's a META entry in the pool.
+
+    A META entry whose file is gone can no longer be unloaded by path and
+    can't be read back for provenance, so such a file is kept. With
+    ``orphan=True`` (from ``__del__``: no manager will clean it up any
+    more) a kept file is left to :func:`_sweep_orphaned_localized`, or to
+    :func:`_cleanup_localized_metakernels` at exit; ``__del__`` may run on
+    any thread, so it also doesn't wait for a busy pool lock.
+    """
+    if not _pool_lock.acquire(blocking=not orphan):
+        _mark_orphaned(path)
+        return
+    try:
+        if _is_furnished(path):
+            log.debug(f"Keeping temp metakernel {path}: still in the pool")
+            if orphan:
+                _mark_orphaned(path)
+            return
+        _delete_localized(path)
+    except Exception:  # noqa: BLE001 - may run in __del__ / at shutdown
+        pass
+    finally:
+        _pool_lock.release()
+
+
+def _mark_orphaned(path: Path) -> None:
+    with _localized_lock:
+        if _registry_key(path) in _localized_metakernels:
+            _orphaned_localized[_registry_key(path)] = path
+
+
+def _sweep_orphaned_localized() -> None:
+    """Delete orphaned localized copies that are no longer in the pool.
+    Call with the pool lock held."""
+    with _localized_lock:
+        orphans = list(_orphaned_localized.values())
+    for path in orphans:
+        if not _is_furnished(path):
+            _delete_localized(path)
+
+
+@atexit.register
+def _cleanup_localized_metakernels() -> None:
+    """Delete every localized temp copy still on disk."""
+    with _localized_lock:
+        paths = list(_localized_metakernels)
+        _localized_metakernels.clear()
+        _orphaned_localized.clear()
+    for p in paths:
+        try:
+            Path(p).unlink(missing_ok=True)
+        except OSError:
+            pass
 
 # ESA JUICE metakernels declare their own SPICE Kernel Dataset version and a
 # unique identifier as \begindata keywords, e.g.:
@@ -160,13 +343,141 @@ def _kernels_referenced_by_metakernel(tm_path: Path) -> frozenset[str]:
     except OSError:
         return frozenset()
 
-    match = _PATH_VALUES_RE.search(content)
-    if match is None:
+    values = _read_path_values(content)
+    if not values or len(values) != 1:
         return frozenset()
-    kernels_dir = Path(match.group(1))
+    kernels_dir = Path(values[0])
 
     rel_paths = _parse_mk_kernel_paths(content)
     return frozenset(str(kernels_dir / rel) for rel in rel_paths)
+
+
+def _identify_pool_metakernel(
+    meta_paths: list[str],
+) -> tuple[str | None, str | None, frozenset[str]]:
+    """``(metakernel, kernels_dir, referenced_kernels)`` for the most
+    recently furnished of the pool's META entries *meta_paths*.
+
+    A localized temp copy written by this library is reported as the real
+    metakernel it was made from, from :data:`_localized_metakernels`, even
+    once the temp file is gone. Any other metakernel is read from disk.
+    """
+    if not meta_paths:
+        return None, None, frozenset()
+    if len(meta_paths) > 1:
+        log.debug(
+            f"{len(meta_paths)} META entries in pool, "
+            "using the most recently furnished one",
+        )
+    metakernel = meta_paths[-1]
+    localized = _lookup_localized(metakernel)
+    if localized is not None:
+        return str(localized.source), str(localized.kernels_dir), localized.kernels
+    path = Path(metakernel)
+    try:
+        values = _read_path_values(path.read_text(encoding="utf-8", errors="replace"))
+    except OSError:
+        values = None
+    kernels_dir = values[0] if values and len(values) == 1 else None
+    return metakernel, kernels_dir, _kernels_referenced_by_metakernel(path)
+
+
+def _snapshot_path_layout(
+    kernels: list[str],
+) -> tuple[list[str], list[str], str]:
+    """``(path_lines, kernels_to_load, common_prefix)`` for
+    :meth:`QuickSpiceManager.snapshot_pool`."""
+    # Factor out the longest common directory prefix as PATH_VALUES so that
+    # each KERNELS_TO_LOAD entry uses the $KERNELS symbol instead of the
+    # full absolute path — this keeps entries short and makes the
+    # snapshot more portable.
+    common_prefix = ""
+    per_directory = False
+    if kernels:
+        try:
+            common_prefix = os.path.commonpath(kernels)
+        except ValueError:  # mixed absolute/relative, or several drives
+            per_directory = True
+        else:
+            # commonpath may return a file path if all kernels share the
+            # same parent; ensure we always get a directory.
+            if not Path(common_prefix).is_dir():
+                common_prefix = str(Path(common_prefix).parent)
+            # Kernels in unrelated trees share only the filesystem root;
+            # one symbol per directory then keeps every entry short.
+            per_directory = Path(common_prefix).parent == Path(common_prefix)
+
+    path_lines: list[str] = []
+    if per_directory:
+        dirs = list(dict.fromkeys(str(Path(k).parent) for k in kernels))
+        symbol = {d: f"D{i}" for i, d in enumerate(dirs)}
+        rel_kernels = [
+            f"${symbol[str(Path(k).parent)]}/{Path(k).name}" for k in kernels
+        ]
+        path_lines = [
+            "PATH_VALUES = (",
+            *[line for d in dirs for line in _quoted_lines(d, "    ")],
+            ")",
+            "PATH_SYMBOLS = (",
+            *[f"    '{symbol[d]}'" for d in dirs],
+            ")",
+        ]
+        common_prefix = ""
+    elif common_prefix:
+        rel_kernels = [
+            "$KERNELS/" + Path(k).relative_to(common_prefix).as_posix()
+            for k in kernels
+        ]
+        if len(common_prefix) <= _MAX_STRING_LENGTH:
+            path_lines = [f"PATH_VALUES = ( '{common_prefix}' )"]
+        else:
+            path_lines = [
+                "PATH_VALUES = (",
+                *_quoted_lines(common_prefix, "    "),
+                ")",
+            ]
+        path_lines.append("PATH_SYMBOLS = ( 'KERNELS' )")
+    else:
+        rel_kernels = kernels
+    return path_lines, rel_kernels, common_prefix
+
+
+def _snapshot_provenance_lines(
+    meta_paths: list[str], kernels: list[str],
+) -> tuple[list[str], list[str]]:
+    """``(keyword_lines, comment_lines)`` describing the pool's metakernel,
+    for :meth:`QuickSpiceManager.snapshot_pool`."""
+    source_mk, _kernels_dir, mk_kernels = _identify_pool_metakernel(meta_paths)
+    skd_version, mk_identifier = _read_mk_keywords(source_mk)
+    keyword_lines = [
+        f"{key} = '{value}'"
+        for key, value in (
+            ("SKD_VERSION", skd_version),
+            ("MK_IDENTIFIER", mk_identifier),
+        )
+        if value is not None
+    ]
+    comment_lines: list[str] = []
+    if source_mk is not None:
+        extra = [k for k in kernels if k not in mk_kernels]
+        comment_lines = [
+            "Snapshot of the SPICE kernel pool, written by quick-spice-manager.",
+            "",
+            "Metakernel in the pool:",
+            *_comment_path_lines(source_mk),
+            "",
+            f"Kernels not in that metakernel ({len(extra)}):",
+            *[line for k in extra for line in _comment_path_lines(k)],
+            "",
+        ]
+    return keyword_lines, comment_lines
+
+
+def _comment_path_lines(path: str, width: int = 120) -> list[str]:
+    """*path* as indented comment lines, wrapped to stay well under the
+    132-character line limit (continuation lines are indented further)."""
+    chunks = [path[i : i + width] for i in range(0, len(path), width)] or [""]
+    return ["   " + chunks[0], *["      " + c for c in chunks[1:]]]
 
 
 def sizeof_fmt(num: float, suffix: str = "B") -> str:
@@ -195,28 +506,28 @@ class QuickSpiceManager:
     --------
     Standalone load/unload::
 
-        sm = SpiceManager(mk="/path/to/kernels.tm")
-        sm.load_kernels()
+        sm = QuickSpiceManager(mk="/path/to/kernels.tm")
+        sm.load_kernels()  # clears the pool first (exclusive=True)
         # ... use SPICE ...
         sm.unload_kernels()
 
     As a context manager (saves and restores the kernel pool on exit)::
 
-        with SpiceManager(mk="/path/to/kernels.tm") as sm:
-            # kernels are loaded here; original pool restored on exit
+        with QuickSpiceManager(mk="/path/to/kernels.tm") as sm:
+            # pool is cleared before loading (exclusive=True, the default);
+            # original pool restored on exit
             ...
 
-    As an exclusive context manager (pool contains *exactly* the metakernel
-    kernels during the block; original pool fully restored on exit)::
+    Keeping what was already loaded (pool contains the previous kernels
+    plus this metakernel's during the block)::
 
-        with SpiceManager(mk="/path/to/kernels.tm", exclusive=True) as sm:
-            # pool is cleared before loading; only this metakernel is active
+        with QuickSpiceManager(mk="/path/to/kernels.tm", exclusive=False) as sm:
             ...
 
     With planetary_coverage TourConfig (requires optional extra)::
 
-        tc = SpiceManager().tour_config  # default target='Jupiter', instrument='JANUS'
-        tc = SpiceManager().get_tour_config(target="Mars", instrument="OTHER")
+        tc = QuickSpiceManager().get_tour_config()  # Jupiter / JANUS
+        tc = QuickSpiceManager().get_tour_config(target="Mars", instrument="OTHER")
         # install with: pip install quick-spice-manager[planetary-coverage]
     """
 
@@ -259,18 +570,19 @@ class QuickSpiceManager:
     # Stores the active manager ref that was in place when __enter__ was called,
     # so __exit__ can restore it (correct LIFO ordering for nested context managers).
     _prior_active_ref: "weakref.ref | None" = field(default=None, init=False)
-
-
-
+    # True when no kernels_dir / SPICE_DIRECTORY was given and _kernels_dir
+    # was taken from a local metakernel's own PATH_VALUES -- i.e. it points
+    # into the user's dataset, not into this package's cache.
+    _kernels_dir_from_mk: bool = field(default=False, init=False)
 
     def __del__(self) -> None:
-        """Delete the localized temp metakernel file when the instance is garbage-collected."""
-        path = getattr(self, "_localized_mk_path", None)
-        if path is not None:
-            try:
-                path.unlink(missing_ok=True)
-            except Exception:  # noqa: BLE001
-                pass
+        """Delete the localized temp metakernel file when the instance is
+        garbage-collected -- unless it's still in the pool (its kernels stay
+        loaded after the manager is gone); it's then deleted at exit."""
+        for name in ("_localized_mk_path", "_loaded_mk_path"):
+            path = getattr(self, name, None)
+            if path is not None:
+                _delete_localized_if_unused(path, orphan=True)
 
     def _process_metakernel_override(self):
         """
@@ -332,7 +644,31 @@ class QuickSpiceManager:
         log.warning(f"Using as default meta-kernel {self._mk}")
 
         if self._kernels_dir is None:
-            self._kernels_dir = self.user_kernels_cache_directory
+            self._kernels_dir = self._default_kernels_dir()
+        log.info(f"Using kernels directory {self._kernels_dir}")
+
+    def _default_kernels_dir(self) -> Path:
+        """Kernels directory when neither ``kernels_dir`` nor
+        ``SPICE_DIRECTORY`` is given.
+
+        A local metakernel's kernels are the ones its own ``PATH_VALUES``
+        points to (relative to the metakernel's folder), not the download
+        cache's. The cache is used for FTP-resolved metakernels, and for
+        local ones that don't declare exactly one ``PATH_VALUES`` entry.
+        """
+        mk_path = Path(self._mk)
+        if mk_path.is_file():
+            declared = _kernels_dir_from_metakernel(mk_path)
+            if declared is not None:
+                self._kernels_dir_from_mk = True
+                return declared
+            log.info(
+                f"Local metakernel {mk_path} does not declare a single "
+                "PATH_VALUES entry; using the kernels cache directory "
+                f"{self.user_kernels_cache_directory}. Pass kernels_dir to "
+                "choose another one.",
+            )
+        return self.user_kernels_cache_directory
 
     def _resolve_metakernel(self) -> Path:
         """Locate the metakernel file, downloading it via FTP if not already local.
@@ -364,6 +700,10 @@ class QuickSpiceManager:
         ``spiceypy.unload()`` needs to re-read the file to determine which
         individual kernels to unload.
 
+        A *kernels_dir* longer than 80 characters is written as several
+        '+'-continued strings, one per line (see :data:`_MAX_STRING_LENGTH`).
+        The temp file is registered in :data:`_localized_metakernels`.
+
         Raises
         ------
         ValueError
@@ -378,14 +718,23 @@ class QuickSpiceManager:
 
         content = mk_path.read_text(encoding="utf-8")
 
-        # Rewrite PATH_VALUES = ( '...' ) with the local kernels_dir.
-        # Matches a single-quoted path between PATH_VALUES = ( and ), including
-        # surrounding whitespace variants as used by ESA JUICE metakernels.
-        localized = re.sub(
-            r"(PATH_VALUES\s*=\s*\(\s*')([^']+)('\s*\))",
-            lambda m: m.group(1) + kernels_dir_str + m.group(3),
-            content,
-        )
+        # Rewrite a single-valued PATH_VALUES = ( '...' ) with the local
+        # kernels_dir, whatever whitespace (or '+' continuation) it uses.
+        # A PATH_VALUES with several entries is left as it is.
+        def _rewrite(m: re.Match[str]) -> str:
+            if len(_join_continued(_QUOTED_RE.findall(m.group(1)))) != 1:
+                return m.group(0)
+            chunks = _split_string_value(kernels_dir_str)
+            if len(chunks) == 1 and len(_QUOTED_RE.findall(m.group(1))) == 1:
+                # Same layout as the original, only the path replaced.
+                return _QUOTED_RE.sub(
+                    lambda _q: f"'{kernels_dir_str}'", m.group(0), count=1,
+                )
+            indent = " " * len("PATH_VALUES = ( ")
+            lines = _quoted_lines(kernels_dir_str, indent)
+            return "PATH_VALUES = (\n" + "\n".join(lines) + "\n" + indent + ")"
+
+        localized = _PATH_VALUES_RE.sub(_rewrite, content)
 
         tmp = NamedTemporaryFile(
             mode="w",
@@ -396,7 +745,14 @@ class QuickSpiceManager:
         )
         tmp.write(localized)
         tmp.close()
-        return Path(tmp.name)
+        tmp_path = Path(tmp.name)
+        with _localized_lock:
+            _localized_metakernels[_registry_key(tmp_path)] = _LocalizedMetakernel(
+                source=mk_path,
+                kernels_dir=Path(kernels_dir_str),
+                kernels=_kernels_referenced_by_metakernel(tmp_path),
+            )
+        return tmp_path
 
     def _pool_files(self) -> frozenset[str]:
         """Return the set of non-META kernel file paths currently in the SPICE pool."""
@@ -567,7 +923,15 @@ class QuickSpiceManager:
         global _active_manager_ref
         kernels_dir = self._kernels_dir
         assert kernels_dir is not None  # noqa: S101 - set in __attrs_post_init__
-        with _furnish_slot(kernels_dir), _pool_lock:
+        # The slot's lock files live next to the directory they guard. A
+        # kernels dir taken from a local metakernel is the user's dataset,
+        # possibly read-only, so take the mission cache's slot instead.
+        slot_dir = (
+            self.user_kernels_cache_directory
+            if self._kernels_dir_from_mk
+            else kernels_dir
+        )
+        with _furnish_slot(slot_dir), _pool_lock:
             if self._loaded_mk_path is not None:
                 log.warning(
                     "load_kernels() called while this manager is already loaded; "
@@ -610,6 +974,7 @@ class QuickSpiceManager:
             # the metakernel itself specifies, used by kernel_provenance()
             # to separate "from the metakernel" from "added afterward".
             self._metakernel_kernels = self._expected_kernels
+            _sweep_orphaned_localized()
 
             # Save who was active before taking ownership (for unload restore).
             self._prior_active_ref = _active_manager_ref
@@ -684,8 +1049,16 @@ class QuickSpiceManager:
         """Write the current SPICE kernel pool to a metakernel file.
 
         Creates a standard KPL/MK file listing every currently loaded kernel
-        (excluding META-type entries) so the exact pool state can be reproduced
-        later by furnishing the output file.
+        (excluding META-type entries), in load order, so the exact pool state
+        can be reproduced later by furnishing the output file.
+
+        When every kernel is under one directory below the filesystem root,
+        that directory is the single ``$KERNELS`` path symbol. Otherwise
+        (kernels in unrelated trees) each kernel directory gets its own
+        symbol, ``$D0``, ``$D1``, .... Strings longer than 80 characters are
+        written with '+' continuation. If the pool's metakernel is known, its
+        ``SKD_VERSION`` / ``MK_IDENTIFIER`` are copied into the snapshot and
+        the kernels loaded on top of it are listed in its comments.
 
         Parameters
         ----------
@@ -709,9 +1082,11 @@ class QuickSpiceManager:
         with _pool_lock:
             n = spiceypy.ktotal("ALL")
             kernels: list[str] = []
+            meta_paths: list[str] = []
             for i in range(n):
                 fname, ftype, _source, _handle = spiceypy.kdata(i, "ALL")
                 if ftype.strip().upper() == "META":
+                    meta_paths.append(fname)
                     continue
                 if len(fname) > _KERNEL_MAX_LENGTH:
                     raise ValueError(
@@ -720,52 +1095,23 @@ class QuickSpiceManager:
                     )
                 kernels.append(fname)
 
-        # Factor out the longest common directory prefix as PATH_VALUES so that
-        # each KERNELS_TO_LOAD entry uses the $KERNELS symbol instead of the
-        # full absolute path — this keeps entries well within the NAIF 255-char
-        # limit and makes the snapshot more portable.
-        common_prefix = ""
-        if kernels:
-            # os.path.commonpath works on the directory parts
-            import os
-            common_prefix = os.path.commonpath(kernels)
-            # commonpath may return a file path if all kernels share the same
-            # parent; ensure we always get a directory.
-            if not Path(common_prefix).is_dir():
-                common_prefix = str(Path(common_prefix).parent)
-
-        if common_prefix:
-            rel_kernels = [
-                "$KERNELS/" + Path(k).relative_to(common_prefix).as_posix()
-                for k in kernels
-            ]
-            path_block = (
-                f"PATH_VALUES = ( '{common_prefix}' )\n"
-                f"PATH_SYMBOLS = ( 'KERNELS' )\n"
-            )
-        else:
-            rel_kernels = kernels
-            path_block = ""
-
-        # Validate that no entry exceeds the limit after symbol substitution
-        for entry in rel_kernels:
-            resolved_len = len(entry.replace("$KERNELS", common_prefix))
-            if resolved_len > _KERNEL_MAX_LENGTH:
-                raise ValueError(
-                    f"Kernel path exceeds NAIF {_KERNEL_MAX_LENGTH}-char limit "
-                    f"(resolved len={resolved_len}): {entry}",
-                )
+        path_lines, rel_kernels, common_prefix = _snapshot_path_layout(kernels)
+        keyword_lines, comment_lines = _snapshot_provenance_lines(
+            meta_paths, kernels,
+        )
 
         lines = [
             "KPL/MK",
             "",
             "\\begindata",
-            path_block,
+            "".join(line + "\n" for line in path_lines),
             "KERNELS_TO_LOAD = (",
-            *[f"    '{k}'" for k in rel_kernels],
+            *[line for k in rel_kernels for line in _quoted_lines(k, "    ")],
             ")",
+            *keyword_lines,
             "\\begintext",
             "",
+            *comment_lines,
         ]
         out.write_text("\n".join(lines), encoding="utf-8")
         log.info(
@@ -811,6 +1157,9 @@ class QuickSpiceManager:
             is an ISO-8601 UTC timestamp of when this manager last
             resolved the metakernel -- the closest thing to a version
             string when ``version='latest'`` was used.
+            ``kernels_dir``: str path of the directory the metakernel's
+            kernels were loaded from (``source='pool'``: ``None`` if it
+            can't be determined).
             ``extra_kernels``: sorted list of kernel paths present beyond
             what the metakernel itself specifies.
             ``all_kernels``: sorted list of every kernel currently loaded.
@@ -858,6 +1207,7 @@ class QuickSpiceManager:
                 "mk": self._mk,
                 "version": self._version,
                 "resolved_at": resolved_at,
+                "kernels_dir": str(self._kernels_dir),
                 "extra_kernels": extra,
                 "all_kernels": sorted(self._expected_kernels),
             }
@@ -874,17 +1224,9 @@ class QuickSpiceManager:
                 else:
                     all_kernels.append(fname)
 
-        if len(meta_paths) > 1:
-            log.debug(
-                f"kernel_provenance: {len(meta_paths)} META entries in pool, "
-                "using the most recently furnished one",
-            )
-        metakernel = meta_paths[-1] if meta_paths else None
-
-        metakernel_kernels: frozenset[str] = frozenset()
-        if metakernel is not None:
-            metakernel_kernels = _kernels_referenced_by_metakernel(Path(metakernel))
-
+        metakernel, kernels_dir, metakernel_kernels = _identify_pool_metakernel(
+            meta_paths,
+        )
         extra = sorted(set(all_kernels) - metakernel_kernels)
         return {
             "metakernel": metakernel,
@@ -892,6 +1234,7 @@ class QuickSpiceManager:
             "mk": None,
             "version": None,
             "resolved_at": None,
+            "kernels_dir": kernels_dir,
             "extra_kernels": extra,
             "all_kernels": sorted(all_kernels),
         }
@@ -920,25 +1263,19 @@ class QuickSpiceManager:
                 spiceypy.unload(self._loaded_mk_path.as_posix())
 
             if self._loaded_mk_path is not None:
-                try:
-                    self._loaded_mk_path.unlink()
-                except OSError:
-                    log.warning(
-                        f"Could not delete temp metakernel file {self._loaded_mk_path}",
-                    )
+                # Unloaded (or kclear'ed) above, so no longer in the pool.
+                _delete_localized(self._loaded_mk_path)
                 self._loaded_mk_path = None
                 self._localized_mk_path = None  # invalidate resolved_mk cache
             elif self._localized_mk_path is not None:
                 # resolved_mk was accessed without load_kernels() —
                 # clean up the temp file.
-                try:
-                    self._localized_mk_path.unlink(missing_ok=True)
-                except OSError:
-                    pass
+                _delete_localized(self._localized_mk_path)
                 self._localized_mk_path = None
 
             self._expected_kernels = None
             self._metakernel_kernels = None
+            _sweep_orphaned_localized()
 
             # Restore previous active manager reference for nested/manual stacking.
             if self._prior_active_ref is not None:
@@ -1041,6 +1378,10 @@ class QuickSpiceManager:
             ``.tour_config`` as a plain attribute. Emits a
             ``DeprecationWarning`` -- use :meth:`get_tour_config` instead
             (same defaults, called explicitly: ``sm.get_tour_config()``).
+            Code that used ``.tour_config`` only to load kernels can call
+            :meth:`load_kernels` instead, but note the difference:
+            ``TourConfig`` *adds* to the pool, while ``load_kernels()``
+            clears it first unless the manager has ``exclusive=False``.
 
         Requires the ``planetary-coverage`` optional extra::
 
@@ -1048,7 +1389,9 @@ class QuickSpiceManager:
         """
         warnings.warn(
             "QuickSpiceManager.tour_config (property) is deprecated and will "
-            "be removed in a future release. Use get_tour_config() instead.",
+            "be removed in a future release. Use get_tour_config() instead, "
+            "or load_kernels() if you only need the kernels loaded (note: "
+            "load_kernels() clears the pool first unless exclusive=False).",
             DeprecationWarning,
             stacklevel=2,
         )

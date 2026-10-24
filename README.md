@@ -28,6 +28,19 @@ pip install quick-spice-manager
 
 > **Note:** The `SpiceManager` name is a deprecated alias for `QuickSpiceManager` and will be removed in a future release. Use `QuickSpiceManager` in new code.
 
+### Migrating from 0.1.x
+
+| 0.1.x | 0.2.0 |
+|---|---|
+| `SpiceManager` | `QuickSpiceManager` |
+| `sm.tour_config` to get a `TourConfig` | `sm.get_tour_config()` |
+| `sm.tour_config` only to load kernels | `sm.load_kernels()`; pass `exclusive=False` to keep what was loaded before |
+
+`tour_config` loads through `planetary_coverage.TourConfig`, which **adds** to
+the SPICE pool. `load_kernels()` defaults to `exclusive=True` and **clears**
+the pool first, so code that loads two metakernels one after the other keeps
+only the last one unless it passes `exclusive=False`.
+
 ## Usage
 
 ### Basic usage
@@ -122,11 +135,17 @@ sm.add_kernel(["/path/to/a.tls", "/path/to/b.bsp"])        # multiple files
 ### Saving the current pool state
 
 Write the live SPICE pool to a portable metakernel file that can be re-furnished
-later to reproduce the exact same set of loaded kernels:
+later to reproduce the exact same set of loaded kernels, in the same order:
 
 ```python
 sm.snapshot_pool("/tmp/pool_snapshot.tm")
 ```
+
+Kernels under one directory share a single `$KERNELS` path symbol; kernels
+spread over unrelated trees get one symbol per directory. Strings longer than
+SPICE's 80-character limit are split with `+` continuation. When the pool's
+metakernel is known, its `SKD_VERSION` / `MK_IDENTIFIER` are copied into the
+snapshot, and the kernels loaded on top of it are listed in its comments.
 
 ### Pool management
 
@@ -138,8 +157,9 @@ sm.clean_pool()       # unload extras and re-furnish missing kernels
 
 ### Inspecting the current configuration
 
-`sm.config` returns a pandas DataFrame — spacecraft, version, the resolved
-metakernel path, and kernels directory — resolved entirely from this
+`sm.config` returns a pandas DataFrame — spacecraft, version, the
+metakernel's own `SKD_VERSION` / `MK_IDENTIFIER` (when it declares them), the
+resolved metakernel path, and kernels directory — resolved entirely from this
 manager's own state. Unlike `tour_config` below, it does **not** require the
 `planetary-coverage` extra and doesn't report target/instrument, since those
 belong to `TourConfig`, not this manager:
@@ -165,6 +185,7 @@ info["version"]          # 'v462_20260223_001' (or 'latest')
 info["resolved_at"]      # ISO-8601 UTC timestamp of when this was resolved --
                           # the closest thing to a version string when
                           # version='latest' was used
+info["kernels_dir"]      # directory the metakernel's kernels were loaded from
 info["extra_kernels"]    # kernels added beyond the metakernel, e.g. via add_kernel()
 info["all_kernels"]      # every kernel currently loaded, flattened
 ```
@@ -178,6 +199,12 @@ calling `load_kernels()` on this instance):
 info = sm.kernel_provenance(source="pool")
 ```
 
+The pool itself holds a temporary, localized copy of the metakernel;
+`source="pool"` reports the real metakernel it was made from, also after the
+manager that loaded it has been garbage-collected. (The temporary copy is
+kept on disk while it is in the pool, and deleted by `unload_kernels()` or at
+interpreter exit.)
+
 ### Cache management
 
 ```python
@@ -187,16 +214,26 @@ sm.clear_cache()       # delete cached kernels (will re-download on next use)
 
 ### Using a local metakernel
 
-Pass an absolute path to an existing `.tm` file to skip FTP resolution:
+Pass the path to an existing `.tm` file to skip FTP resolution. The kernels
+are the ones the metakernel itself points to: its `PATH_VALUES`, resolved
+relative to the metakernel's own folder. For an ESA kernel dataset (e.g.
+`JUICE.zip`, whose metakernels use `PATH_VALUES = ( '..' )`) that is the
+dataset's `kernels/` folder:
 
 ```python
-sm = QuickSpiceManager(
-    spacecraft="JUICE",
-    mk="/path/to/my_local.tm",
-    kernels_dir="/path/to/kernels",
-)
-sm.load_kernels()
+sm = QuickSpiceManager(mk="/path/to/JUICE/kernels/mk/juice_crema_5_1_150lb_23_1_a3.tm")
+sm.load_kernels()   # loads /path/to/JUICE/kernels/...
 ```
+
+Pass `kernels_dir` (or set `SPICE_DIRECTORY`) to load the kernels from
+another folder instead:
+
+```python
+sm = QuickSpiceManager(mk="/path/to/my_local.tm", kernels_dir="/path/to/kernels")
+```
+
+A local metakernel that doesn't declare exactly one `PATH_VALUES` entry falls
+back to the download cache directory, as metakernels resolved via FTP do.
 
 ### planetary-coverage integration
 
@@ -229,7 +266,7 @@ Two environment variables (readable from a `.env` file in the working directory)
 | Variable | Effect |
 |---|---|
 | `SPICE_METAKERNEL` | Path to a local metakernel file. Disables automatic FTP download. |
-| `SPICE_DIRECTORY` | Directory containing the kernel files referenced by the metakernel. |
+| `SPICE_DIRECTORY` | Directory containing the kernel files referenced by the metakernel. Takes precedence over `kernels_dir` and over the metakernel's own `PATH_VALUES`. |
 
 ```sh
 # .env

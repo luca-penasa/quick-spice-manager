@@ -6,6 +6,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## Unreleased
 
+### Added
+
+- `sm.config` (and the notebook display) report the metakernel's own `SKD_VERSION` and `MK_IDENTIFIER` keywords, when it declares them.
+- `kernel_provenance()` reports `kernels_dir`, the directory the metakernel's kernels were loaded from.
+- `snapshot_pool()` copies `SKD_VERSION` / `MK_IDENTIFIER` from the pool's metakernel and lists the kernels loaded on top of it in its comments.
+- README: a migration table from 0.1.x.
+
+### Changed
+
+- A local metakernel given without `kernels_dir` (or `SPICE_DIRECTORY`) now loads the kernels its own `PATH_VALUES` points to, resolved relative to the metakernel's folder (`'..'` in ESA datasets), instead of the download cache. Explicit `kernels_dir` and `SPICE_DIRECTORY` still take precedence, and a local metakernel without a single `PATH_VALUES` entry still uses the cache.
+- The localized temporary metakernel is no longer deleted when its manager is garbage-collected while it is still in the SPICE pool. It is deleted by `unload_kernels()`, or at interpreter exit.
+- The `tour_config` deprecation warning now also points to `load_kernels()`, and says that it clears the pool unless `exclusive=False`.
+
+### Fixed
+
+- A local metakernel (e.g. from ESA's `JUICE.zip`) failed with `SpiceNOSUCHFILE` on a fresh machine, or silently loaded the cache's kernels on a machine with a populated cache.
+- `kernel_provenance(source="pool")` reported the temporary localized metakernel instead of the real one, and, after the manager was garbage-collected, reported every loaded kernel as extra.
+- `snapshot_pool()` wrote kernel paths over SPICE's 80-character string limit when kernels came from more than one directory tree (common prefix `/`), so `furnsh` of the snapshot failed with `SpiceNOSUCHFILE`. Kernels in unrelated trees now get one path symbol per directory, and long strings are split with `+` continuation.
+- A `kernels_dir` longer than 80 characters was truncated in the localized metakernel (and over ~110 characters failed with `SPICE(TYPEMISMATCH)`). It is now split with `+` continuation.
+
 ## 0.2.0 - 2026-07-13
 
 ### Added
@@ -27,7 +47,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Deprecated
 
-- `tour_config` (property) is deprecated in favor of `get_tour_config()`. It still works with the same defaults (`target='Jupiter'`, `instrument='JANUS'`) for backward compatibility, but emits a `DeprecationWarning`.
+- `tour_config` (property) is deprecated in favor of `get_tour_config()`. It still works with the same defaults (`target='Jupiter'`, `instrument='JANUS'`) for backward compatibility, but emits a `DeprecationWarning`. Code that used `tour_config` only to load kernels can call `load_kernels()` instead, but `TourConfig` adds to the pool while `load_kernels()` clears it first unless `exclusive=False`.
 
 ### Removed
 

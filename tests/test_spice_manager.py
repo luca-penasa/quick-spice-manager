@@ -7,6 +7,7 @@ network access required.
 
 from __future__ import annotations
 
+import re
 import tempfile
 import textwrap
 import threading
@@ -1007,6 +1008,7 @@ def test_config_resolves_without_tour_config_or_planetary_coverage(tmp_path):
     assert table.loc["metakernel", "value"] == str(mk)
     assert table.loc["kernels_dir", "value"] == tmp_path
     assert "target" not in table.index
+    assert "instrument" not in table.index
     assert table.loc["skd_version", "value"] is None
     assert table.loc["mk_identifier", "value"] is None
 
@@ -1453,3 +1455,303 @@ def test_kernel_provenance_pool_works_without_loading(tmp_path):
     assert info["metakernel"] is None
     assert info["all_kernels"] == []
     assert info["extra_kernels"] == []
+
+
+# ---------------------------------------------------------------------------
+# Localized metakernel format: unchanged for short paths, continued for long
+# ---------------------------------------------------------------------------
+
+_ESA_STYLE_MK = textwrap.dedent("""\
+    KPL/MK
+
+    \\begindata
+
+      PATH_VALUES       = ( '..'      )
+
+      PATH_SYMBOLS      = ( 'KERNELS' )
+
+      KERNELS_TO_LOAD   = (
+
+                          '$KERNELS/fk/juice_v45.tf'
+
+                          )
+
+    \\begintext
+""")
+
+
+def _localize_like_0_2_0(content: str, kernels_dir: str) -> str:
+    """The rewrite _localize_metakernel did in 0.2.0, for comparison."""
+    import re
+
+    return re.sub(
+        r"(PATH_VALUES\s*=\s*\(\s*')([^']+)('\s*\))",
+        lambda m: m.group(1) + kernels_dir + m.group(3),
+        content,
+    )
+
+
+@pytest.mark.parametrize("content", [_MINIMAL_MK, _ESA_STYLE_MK])
+def test_localize_short_path_output_identical_to_0_2_0(tmp_path, content):
+    mk = _make_local_mk(tmp_path, content=content)
+    sm = _make_sm(tmp_path, mk=mk)
+
+    tmp_mk = sm._localize_metakernel(mk)
+    try:
+        assert tmp_mk.read_text(encoding="utf-8") == _localize_like_0_2_0(
+            content, str(tmp_path),
+        )
+    finally:
+        tmp_mk.unlink(missing_ok=True)
+
+
+def test_localize_long_path_uses_continuation(tmp_path):
+    mk = _make_local_mk(tmp_path, content=_ESA_STYLE_MK)
+    long_dir = "/" + "/".join(["component_of_a_long_path"] * 6)
+    assert len(long_dir) > 80
+    sm = SpiceManager(mk=str(mk), kernels_dir=long_dir, download_kernels=False)
+
+    tmp_mk = sm._localize_metakernel(mk)
+    try:
+        content = tmp_mk.read_text(encoding="utf-8")
+        values = spice_manager_module._read_path_values(content)
+        assert values == [long_dir]
+        assert all(len(line) <= 132 for line in content.splitlines())
+        quoted = re.findall(r"'([^']*)'", content.split("PATH_SYMBOLS")[0])
+        assert all(len(q) <= 80 for q in quoted)
+        assert len(quoted) > 1
+    finally:
+        tmp_mk.unlink(missing_ok=True)
+
+
+def test_localize_rewrites_already_continued_path_values(tmp_path):
+    content = _MINIMAL_MK.replace(
+        "PATH_VALUES = ( '/original/kernels' )",
+        "PATH_VALUES = ( '/original/+'\n                 'kernels' )",
+    )
+    mk = _make_local_mk(tmp_path, content=content)
+    sm = _make_sm(tmp_path, mk=mk)
+
+    tmp_mk = sm._localize_metakernel(mk)
+    try:
+        localized = tmp_mk.read_text(encoding="utf-8")
+        assert spice_manager_module._read_path_values(localized) == [str(tmp_path)]
+        assert "original" not in localized
+    finally:
+        tmp_mk.unlink(missing_ok=True)
+
+
+def test_localize_leaves_multi_valued_path_values_alone(tmp_path):
+    """Unchanged from 0.2.0: several PATH_VALUES entries aren't rewritten."""
+    content = _MINIMAL_MK.replace(
+        "PATH_VALUES = ( '/original/kernels' )",
+        "PATH_VALUES = ( '/a', '/b' )",
+    ).replace("PATH_SYMBOLS = ( 'KERNELS' )", "PATH_SYMBOLS = ( 'A', 'B' )")
+    mk = _make_local_mk(tmp_path, content=content)
+    sm = _make_sm(tmp_path, mk=mk)
+
+    tmp_mk = sm._localize_metakernel(mk)
+    try:
+        assert tmp_mk.read_text(encoding="utf-8") == content
+    finally:
+        tmp_mk.unlink(missing_ok=True)
+
+
+def test_localize_handles_parenthesis_in_kernels_dir(tmp_path):
+    kd = tmp_path / "Program Files (x86)" / "kernels"
+    mk = _make_local_mk(tmp_path)
+    sm = SpiceManager(mk=str(mk), kernels_dir=kd, download_kernels=False)
+
+    tmp_mk = sm._localize_metakernel(mk)
+    try:
+        content = tmp_mk.read_text(encoding="utf-8")
+        assert spice_manager_module._read_path_values(content) == [str(kd)]
+    finally:
+        tmp_mk.unlink(missing_ok=True)
+
+
+@pytest.mark.parametrize("length", [0, 1, 80, 81, 156, 157, 255])
+def test_split_and_join_string_value_round_trip(length):
+    value = ("abcdefghij" * 26)[:length]
+    chunks = spice_manager_module._split_string_value(value)
+    assert all(len(c) <= 80 for c in chunks)
+    assert spice_manager_module._join_continued(chunks) == [value]
+    if length <= 80:
+        assert chunks == [value]
+
+
+# ---------------------------------------------------------------------------
+# Default kernels_dir
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def isolated_cache(tmp_path, monkeypatch):
+    monkeypatch.delenv("SPICE_DIRECTORY", raising=False)
+    monkeypatch.delenv("SPICE_METAKERNEL", raising=False)
+    monkeypatch.setattr(spice_manager_module, "load_dotenv", lambda: False)
+    cache_root = tmp_path / "cache"
+    monkeypatch.setattr(
+        spice_manager_module,
+        "get_user_kernels_cache_directory",
+        lambda: cache_root,
+    )
+    return cache_root
+
+
+def test_ftp_metakernel_without_kernels_dir_uses_cache(isolated_cache):
+    sm = SpiceManager(mk="plan", download_kernels=False)
+    assert sm._kernels_dir == isolated_cache / "juice"
+    assert sm._kernels_dir_from_mk is False
+
+
+def test_local_metakernel_relative_path_values_resolved_from_its_folder(
+    tmp_path, isolated_cache,
+):
+    mk_dir = tmp_path / "ds" / "kernels" / "mk"
+    mk_dir.mkdir(parents=True)
+    mk = mk_dir / "x.tm"
+    mk.write_text(_ESA_STYLE_MK, encoding="utf-8")
+
+    sm = SpiceManager(mk=str(mk), download_kernels=False)
+
+    assert sm._kernels_dir == (tmp_path / "ds" / "kernels").resolve()
+    assert sm._kernels_dir_from_mk is True
+
+
+@pytest.mark.parametrize(
+    "path_values",
+    ["", "PATH_VALUES = ( '/a', '/b' )\nPATH_SYMBOLS = ( 'A', 'B' )"],
+    ids=["no-path-values", "two-path-values"],
+)
+def test_local_metakernel_without_single_path_values_uses_cache(
+    tmp_path, isolated_cache, path_values,
+):
+    mk = tmp_path / "x.tm"
+    mk.write_text(
+        f"KPL/MK\n\\begindata\n{path_values}\n"
+        "KERNELS_TO_LOAD = ( '/abs/k.tf' )\n\\begintext\n",
+        encoding="utf-8",
+    )
+
+    sm = SpiceManager(mk=str(mk), download_kernels=False)
+
+    assert sm._kernels_dir == isolated_cache / "juice"
+    assert sm._kernels_dir_from_mk is False
+
+
+def test_explicit_kernels_dir_not_overridden_by_local_metakernel(
+    tmp_path, isolated_cache,
+):
+    mk = _make_local_mk(tmp_path, content=_ESA_STYLE_MK)
+    sm = SpiceManager(mk=str(mk), kernels_dir=tmp_path / "x", download_kernels=False)
+    assert sm._kernels_dir == tmp_path / "x"
+    assert sm._kernels_dir_from_mk is False
+
+
+def test_spice_directory_not_overridden_by_local_metakernel(
+    tmp_path, isolated_cache, monkeypatch,
+):
+    mk = _make_local_mk(tmp_path, content=_ESA_STYLE_MK)
+    monkeypatch.setenv("SPICE_DIRECTORY", str(tmp_path / "env"))
+    sm = SpiceManager(mk=str(mk), download_kernels=False)
+    assert sm._kernels_dir == tmp_path / "env"
+
+
+def test_load_kernels_with_metakernel_kernels_dir_uses_cache_slot(
+    tmp_path, isolated_cache,
+):
+    import contextlib
+
+    mk_dir = tmp_path / "ds" / "kernels" / "mk"
+    mk_dir.mkdir(parents=True)
+    mk = mk_dir / "x.tm"
+    mk.write_text(_ESA_STYLE_MK, encoding="utf-8")
+    sm = SpiceManager(mk=str(mk), download_kernels=False)
+
+    with (
+        patch.object(
+            spice_manager_module, "_furnish_slot",
+            return_value=contextlib.nullcontext(),
+        ) as mock_slot,
+        patch("quick_spice_manager.spice_manager.spiceypy") as mock_spice,
+    ):
+        mock_spice.ktotal.return_value = 0
+        sm.load_kernels()
+
+    mock_slot.assert_called_once_with(isolated_cache / "juice")
+
+
+# ---------------------------------------------------------------------------
+# snapshot_pool layout
+# ---------------------------------------------------------------------------
+
+
+def test_snapshot_pool_unrelated_trees_use_one_symbol_per_directory(tmp_path):
+    kernels = [
+        "/data/cache/juice/ck/a.bc",
+        "/home/user/extra/b.bsp",
+        "/data/cache/juice/ck/c.bc",
+    ]
+    sm = _make_sm(tmp_path)
+    out = tmp_path / "snapshot.tm"
+
+    with patch("quick_spice_manager.spice_manager.spiceypy") as mock_spice:
+        mock_spice.ktotal.return_value = len(kernels)
+        mock_spice.kdata.side_effect = [(k, "CK", "file", i) for i, k in enumerate(kernels)]
+        sm.snapshot_pool(out)
+
+    content = out.read_text(encoding="utf-8")
+    assert "PATH_VALUES = ( '/' )" not in content
+    assert "'$D0/a.bc'" in content
+    assert "'$D1/b.bsp'" in content
+    assert "'$D0/c.bc'" in content
+    # Order preserved
+    assert content.index("$D0/a.bc") < content.index("$D1/b.bsp") < content.index("$D0/c.bc")
+    assert spice_manager_module._read_path_values(content) == [
+        "/data/cache/juice/ck",
+        "/home/user/extra",
+    ]
+
+
+def test_snapshot_pool_no_comments_without_metakernel(tmp_path):
+    """Without a META entry the snapshot has no provenance comments, as in 0.2.0."""
+    existing = tmp_path / "juice_fk.tf"
+    existing.write_text("placeholder")
+    sm = _make_sm(tmp_path)
+    out = tmp_path / "snapshot.tm"
+
+    with patch("quick_spice_manager.spice_manager.spiceypy") as mock_spice:
+        mock_spice.ktotal.return_value = 1
+        mock_spice.kdata.return_value = (str(existing), "TEXT", "file", 1)
+        sm.snapshot_pool(out)
+
+    assert out.read_text(encoding="utf-8") == (
+        "KPL/MK\n\n\\begindata\n"
+        f"PATH_VALUES = ( '{tmp_path}' )\nPATH_SYMBOLS = ( 'KERNELS' )\n\n"
+        "KERNELS_TO_LOAD = (\n    '$KERNELS/juice_fk.tf'\n)\n\\begintext\n"
+    )
+
+
+# ---------------------------------------------------------------------------
+# tour_config migration guidance
+# ---------------------------------------------------------------------------
+
+
+def test_tour_config_warning_points_to_load_kernels_and_exclusive(tmp_path):
+    sm = _make_sm(tmp_path)
+    with (
+        patch.object(SpiceManager, "get_tour_config", return_value=object()),
+        pytest.warns(DeprecationWarning) as record,
+    ):
+        sm.tour_config
+
+    message = str(record[0].message)
+    assert "load_kernels()" in message
+    assert "exclusive=False" in message
+
+
+def test_class_docstring_uses_current_api():
+    doc = SpiceManager.__doc__
+    assert "SpiceManager(" not in doc.replace("QuickSpiceManager(", "")
+    assert ".tour_config" not in doc
