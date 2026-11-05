@@ -2893,7 +2893,7 @@ wheels = [
 
 [[package]]
 name = "quick-spice-manager"
-version = "0.2.0"
+version = "0.2.1"
 source = { editable = "." }
 dependencies = [
     { name = "attrs" },

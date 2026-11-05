@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## Unreleased
 
+## 0.2.1 - 2026-11-05
+
 ### Added
 
 - `qsm`, a command line to list metakernels, download and cache kernels, write a furnshable metakernel (`qsm resolve`), and inspect or clear the cache.
