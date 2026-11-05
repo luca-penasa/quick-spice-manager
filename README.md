@@ -41,6 +41,35 @@ the SPICE pool. `load_kernels()` defaults to `exclusive=True` and **clears**
 the pool first, so code that loads two metakernels one after the other keeps
 only the last one unless it passes `exclusive=False`.
 
+## Command line
+
+Installing the package also installs `qsm`:
+
+```sh
+qsm missions                        # supported missions and aliases
+qsm list -s juice --filter plan     # metakernels on the ESA FTP server
+qsm download plan -s juice          # download the metakernel and its kernels
+qsm resolve plan -s juice           # same, then print a furnshable metakernel path
+qsm info plan -s juice              # what's cached, without using the network
+qsm cache list                      # size and location of each cached mission
+qsm cache clear juice               # delete a mission's cached kernels
+```
+
+`MK` is a shortcut (`plan`), a name (`juice_plan`), or the path to a local `.tm`
+file, and defaults to `plan`. `--spacecraft` defaults to `JUICE`. `download` and
+`resolve` also take `--version` to pin an SKD version, `--kernels-dir`, and
+`--offline` to never use the network.
+
+`qsm resolve` prints only the path, and all progress and warnings go to stderr,
+so it can be used in scripts. It writes a copy of the metakernel with
+`PATH_VALUES` pointing at your local kernels, in the mission's cache, or wherever
+`-o FILE` says. It stays there until you clear the cache. Both `download` and
+`resolve` exit with an error if any referenced kernel is missing.
+
+Use `-v` or `-vv` before the command for more logging (`qsm -v download plan`).
+The [environment variables](#environment-variable-overrides) apply here too, and
+replace what's given on the command line; `qsm` prints a note when they're set.
+
 ## Usage
 
 ### Basic usage

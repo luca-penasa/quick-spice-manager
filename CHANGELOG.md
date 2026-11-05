@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Added
 
+- `qsm`, a command line to list metakernels, download and cache kernels, write a furnshable metakernel (`qsm resolve`), and inspect or clear the cache.
 - `sm.config` (and the notebook display) report the metakernel's own `SKD_VERSION` and `MK_IDENTIFIER` keywords, when it declares them.
 - `kernel_provenance()` reports `kernels_dir`, the directory the metakernel's kernels were loaded from.
 - `snapshot_pool()` copies `SKD_VERSION` / `MK_IDENTIFIER` from the pool's metakernel and lists the kernels loaded on top of it in its comments.
@@ -21,6 +22,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Fixed
 
+- A metakernel name given in upper case never matched on the FTP server, so names as listed by `sm.metakernels` could be rejected (e.g. `HUYGENS_V040`).
 - A local metakernel (e.g. from ESA's `JUICE.zip`) failed with `SpiceNOSUCHFILE` on a fresh machine, or silently loaded the cache's kernels on a machine with a populated cache.
 - `kernel_provenance(source="pool")` reported the temporary localized metakernel instead of the real one, and, after the manager was garbage-collected, reported every loaded kernel as extra.
 - `snapshot_pool()` wrote kernel paths over SPICE's 80-character string limit when kernels came from more than one directory tree (common prefix `/`), so `furnsh` of the snapshot failed with `SpiceNOSUCHFILE`. Kernels in unrelated trees now get one path symbol per directory, and long strings are split with `+` continuation.

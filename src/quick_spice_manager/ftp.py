@@ -318,7 +318,7 @@ def _resolve_tm_on_ftp(
     str
         Full FTP path of the resolved ``.tm`` file.
     """
-    mk_clean = mk.removesuffix(".tm")
+    mk_clean = mk.lower().removesuffix(".tm")  # tm_map's keys are lower-case
     mk_dir = f"{base}kernels/mk/"
 
     try:

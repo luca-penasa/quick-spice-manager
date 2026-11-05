@@ -1424,7 +1424,7 @@ class QuickSpiceManager:
         )
         return sizeof_fmt(s)
 
-    def clear_cache(self):
+    def clear_cache(self) -> None:
         """
         Clear the cache.
 

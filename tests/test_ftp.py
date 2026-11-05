@@ -133,6 +133,14 @@ def test_resolve_tm_exact_spacecraft_prefix():
     assert path == "/data/SPICE/JUICE/kernels/mk/juice_plan.tm"
 
 
+@pytest.mark.parametrize("mk", ["HUYGENS_V040", "huygens_v040", "HUYGENS_V040.tm"])
+def test_resolve_tm_name_is_case_insensitive(mk: str):
+    """The server's filename case can differ from the case of the listed name."""
+    remote = "/data/SPICE/HUYGENS/kernels/mk/HUYGENS_V040.TM"
+    ftp = _make_ftp_mock([remote])
+    assert _resolve_tm_on_ftp(ftp, "HUYGENS", mk, "/data/SPICE/HUYGENS/") == remote
+
+
 def test_resolve_tm_bare_name():
     ftp = _make_ftp_mock([
         "/data/SPICE/JUICE/kernels/mk/juice_plan.tm",

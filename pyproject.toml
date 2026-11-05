@@ -31,7 +31,11 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "dotenv>=0.9.9",
     "tqdm>=4.0",
+    "click>=8.1",
 ]
+
+[project.scripts]
+qsm = "quick_spice_manager.cli:main"
 
 [project.optional-dependencies]
 planetary-coverage = ["planetary-coverage>=1.1.1"]
