@@ -17,7 +17,7 @@ bump version_kind:
     just release-changelog {{`uv version --short`}}
 
     # Commit the changes
-    git add {{VERSION_FILE}} {{CHANGELOG}}
+    git add {{VERSION_FILE}} {{CHANGELOG}} uv.lock
     git commit -m "Bumped version to {{`uv version --short`}} and update changelog"
     git tag v{{`uv version --short`}}
     @echo "Version bump and changelog update complete."
