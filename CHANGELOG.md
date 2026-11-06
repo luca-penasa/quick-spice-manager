@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## Unreleased
 
+## 0.2.2 - 2026-11-06
+
 ### Added
 
 - `quick_spice_manager.snapshot_pool(path)`, a module-level function that writes the current SPICE pool to a metakernel without a manager (the pool belongs to the process: kernels loaded by any manager, `spiceypy.furnsh` or another library). `QuickSpiceManager.snapshot_pool` calls it and writes the same file.
