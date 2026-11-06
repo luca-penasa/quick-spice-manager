@@ -480,6 +480,86 @@ def _comment_path_lines(path: str, width: int = 120) -> list[str]:
     return ["   " + chunks[0], *["      " + c for c in chunks[1:]]]
 
 
+def snapshot_pool(path: "Path | str") -> Path:
+    """Write the current SPICE kernel pool to a metakernel file.
+
+    Needs no manager: it reads the pool of this process, whoever loaded it
+    (a manager, ``spiceypy.furnsh``, another library).
+    :meth:`QuickSpiceManager.snapshot_pool` calls it.
+
+    Creates a standard KPL/MK file listing every currently loaded kernel
+    (excluding META-type entries), in load order, so the exact pool state
+    can be reproduced later by furnishing the output file.
+
+    When every kernel is under one directory below the filesystem root,
+    that directory is the single ``$KERNELS`` path symbol. Otherwise
+    (kernels in unrelated trees) each kernel directory gets its own
+    symbol, ``$D0``, ``$D1``, .... Strings longer than 80 characters are
+    written with '+' continuation. If the pool's metakernel is known, its
+    ``SKD_VERSION`` / ``MK_IDENTIFIER`` are copied into the snapshot and
+    the kernels loaded on top of it are listed in its comments.
+
+    Parameters
+    ----------
+    path:
+        Destination path for the snapshot metakernel (typically ``*.tm``).
+        Parent directories are created if they do not exist.
+
+    Returns
+    -------
+    Path
+        The path that was written.
+
+    Raises
+    ------
+    ValueError
+        If any kernel path in the pool exceeds the NAIF 255-character limit.
+    """
+    out = Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    with _pool_lock:
+        n = spiceypy.ktotal("ALL")
+        kernels: list[str] = []
+        meta_paths: list[str] = []
+        for i in range(n):
+            fname, ftype, _source, _handle = spiceypy.kdata(i, "ALL")
+            if ftype.strip().upper() == "META":
+                meta_paths.append(fname)
+                continue
+            if len(fname) > _KERNEL_MAX_LENGTH:
+                raise ValueError(
+                    f"Kernel path exceeds NAIF {_KERNEL_MAX_LENGTH}-char limit "
+                    f"(len={len(fname)}): {fname}",
+                )
+            kernels.append(fname)
+
+    path_lines, rel_kernels, common_prefix = _snapshot_path_layout(kernels)
+    keyword_lines, comment_lines = _snapshot_provenance_lines(
+        meta_paths, kernels,
+    )
+
+    lines = [
+        "KPL/MK",
+        "",
+        "\\begindata",
+        "".join(line + "\n" for line in path_lines),
+        "KERNELS_TO_LOAD = (",
+        *[line for k in rel_kernels for line in _quoted_lines(k, "    ")],
+        ")",
+        *keyword_lines,
+        "\\begintext",
+        "",
+        *comment_lines,
+    ]
+    out.write_text("\n".join(lines), encoding="utf-8")
+    log.info(
+        f"Snapshotted {len(kernels)} kernels to {out}"
+        + (f" (common prefix: {common_prefix})" if common_prefix else ""),
+    )
+    return out
+
+
 def sizeof_fmt(num: float, suffix: str = "B") -> str:
     """
     Human-readable file size.
@@ -1048,77 +1128,10 @@ class QuickSpiceManager:
     def snapshot_pool(self, path: "Path | str") -> Path:
         """Write the current SPICE kernel pool to a metakernel file.
 
-        Creates a standard KPL/MK file listing every currently loaded kernel
-        (excluding META-type entries), in load order, so the exact pool state
-        can be reproduced later by furnishing the output file.
-
-        When every kernel is under one directory below the filesystem root,
-        that directory is the single ``$KERNELS`` path symbol. Otherwise
-        (kernels in unrelated trees) each kernel directory gets its own
-        symbol, ``$D0``, ``$D1``, .... Strings longer than 80 characters are
-        written with '+' continuation. If the pool's metakernel is known, its
-        ``SKD_VERSION`` / ``MK_IDENTIFIER`` are copied into the snapshot and
-        the kernels loaded on top of it are listed in its comments.
-
-        Parameters
-        ----------
-        path:
-            Destination path for the snapshot metakernel (typically ``*.tm``).
-            Parent directories are created if they do not exist.
-
-        Returns
-        -------
-        Path
-            The path that was written.
-
-        Raises
-        ------
-        ValueError
-            If any kernel path in the pool exceeds the NAIF 255-character limit.
+        Same as the module-level :func:`snapshot_pool`, which needs no
+        manager.
         """
-        out = Path(path)
-        out.parent.mkdir(parents=True, exist_ok=True)
-
-        with _pool_lock:
-            n = spiceypy.ktotal("ALL")
-            kernels: list[str] = []
-            meta_paths: list[str] = []
-            for i in range(n):
-                fname, ftype, _source, _handle = spiceypy.kdata(i, "ALL")
-                if ftype.strip().upper() == "META":
-                    meta_paths.append(fname)
-                    continue
-                if len(fname) > _KERNEL_MAX_LENGTH:
-                    raise ValueError(
-                        f"Kernel path exceeds NAIF {_KERNEL_MAX_LENGTH}-char limit "
-                        f"(len={len(fname)}): {fname}",
-                    )
-                kernels.append(fname)
-
-        path_lines, rel_kernels, common_prefix = _snapshot_path_layout(kernels)
-        keyword_lines, comment_lines = _snapshot_provenance_lines(
-            meta_paths, kernels,
-        )
-
-        lines = [
-            "KPL/MK",
-            "",
-            "\\begindata",
-            "".join(line + "\n" for line in path_lines),
-            "KERNELS_TO_LOAD = (",
-            *[line for k in rel_kernels for line in _quoted_lines(k, "    ")],
-            ")",
-            *keyword_lines,
-            "\\begintext",
-            "",
-            *comment_lines,
-        ]
-        out.write_text("\n".join(lines), encoding="utf-8")
-        log.info(
-            f"Snapshotted {len(kernels)} kernels to {out}"
-            + (f" (common prefix: {common_prefix})" if common_prefix else ""),
-        )
-        return out
+        return snapshot_pool(path)
 
     def kernel_provenance(self, source: str = "manager") -> dict[str, Any]:
         """

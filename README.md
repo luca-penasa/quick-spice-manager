@@ -170,6 +170,16 @@ later to reproduce the exact same set of loaded kernels, in the same order:
 sm.snapshot_pool("/tmp/pool_snapshot.tm")
 ```
 
+The pool belongs to the process, not to a manager, so the same function is
+available without one, whoever loaded the kernels (a manager, `spiceypy.furnsh`,
+another library):
+
+```python
+from quick_spice_manager import snapshot_pool
+
+snapshot_pool("/tmp/pool_snapshot.tm")
+```
+
 Kernels under one directory share a single `$KERNELS` path symbol; kernels
 spread over unrelated trees get one symbol per directory. Strings longer than
 SPICE's 80-character limit are split with `+` continuation. When the pool's

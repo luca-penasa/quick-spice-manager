@@ -31,9 +31,9 @@ def log_disable(mod: str = "quick_spice_manager") -> None:
     log.disable(mod)
 
 
-from .spice_manager import QuickSpiceManager
+from .spice_manager import QuickSpiceManager, snapshot_pool
 
-__all__ = ["QuickSpiceManager", "SpiceManager"]
+__all__ = ["QuickSpiceManager", "SpiceManager", "snapshot_pool"]
 
 
 def __getattr__(name: str) -> object:

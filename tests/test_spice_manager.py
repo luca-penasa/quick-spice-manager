@@ -1714,6 +1714,57 @@ def test_snapshot_pool_unrelated_trees_use_one_symbol_per_directory(tmp_path):
     ]
 
 
+def test_snapshot_pool_needs_no_manager(tmp_path):
+    """The module-level function snapshots the pool without a manager, and the method
+    writes the same file."""
+    import quick_spice_manager
+
+    kernels = ["/data/cache/juice/ck/a.bc", "/home/user/extra/b.bsp"]
+    outputs = []
+    for write in (quick_spice_manager.snapshot_pool, _make_sm(tmp_path).snapshot_pool):
+        out = tmp_path / f"snapshot{len(outputs)}.tm"
+        with patch("quick_spice_manager.spice_manager.spiceypy") as mock_spice:
+            mock_spice.ktotal.return_value = len(kernels)
+            mock_spice.kdata.side_effect = [(k, "CK", "file", i) for i, k in enumerate(kernels)]
+            assert write(out) == out
+        outputs.append(out.read_text(encoding="utf-8"))
+    assert outputs[0] == outputs[1]
+    assert "'$D1/b.bsp'" in outputs[0]
+
+
+def test_snapshot_pool_of_a_real_pool_loads_in_a_fresh_process(tmp_path):
+    """Kernels from two trees with long paths (over SPICE's 80-character strings): the
+    snapshot, written without a manager, loads them in another process."""
+    import subprocess
+    import sys
+
+    import spiceypy
+
+    import quick_spice_manager
+
+    kernels = []
+    for i, top in enumerate(["first_" + "a" * 60, "second_" + "b" * 60]):
+        d = tmp_path / top / ("c" * 60)
+        d.mkdir(parents=True)
+        k = d / f"k{i}_{'x' * 40}.tk"
+        k.write_text(f"KPL/FK\n\\begindata\nQSM_SNAPSHOT_TEST_{i} = {i}\n\\begintext\n")
+        kernels.append(str(k))
+    for k in kernels:
+        spiceypy.furnsh(k)
+    try:
+        out = quick_spice_manager.snapshot_pool(tmp_path / "snap.tm")
+    finally:
+        for k in kernels:
+            spiceypy.unload(k)
+    code = (
+        "import spiceypy\n"
+        f"spiceypy.furnsh({str(out)!r})\n"
+        "print([int(spiceypy.gipool(f'QSM_SNAPSHOT_TEST_{i}', 0, 1)[0]) for i in range(2)])\n"
+    )
+    run = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
+    assert run.stdout.strip() == "[0, 1]"
+
+
 def test_snapshot_pool_no_comments_without_metakernel(tmp_path):
     """Without a META entry the snapshot has no provenance comments, as in 0.2.0."""
     existing = tmp_path / "juice_fk.tf"
