@@ -8,7 +8,8 @@ Windows runners pay for it in billed minutes.
 **Kind:** feature. qsm writes the reduced set, and ptr-editor (or any other package) uses it to
 make test data that is committed to the repository, so its tests never download anything.
 **Status (2026-11-07):** tasks 1 and 3 done on branch `reduce-kernels` (`reduce_kernels()`,
-`qsm reduce`, `tests/test_reduce.py`); 2 (CK type 6) open, waiting for a decision; 4 not started.
+`qsm reduce`, `tests/test_reduce.py`); 2 (CK type 6): option 4 chosen for now (dropped for
+ptr-editor, which does not need it); 4 not started.
 See "Status" at the end.
 
 ## Goal
@@ -133,3 +134,21 @@ type 6 layout: mini-segments, their interval bounds and directory). Options:
 3. resample to type 3 inside the windows with a stated tolerance: lossy, simpler;
 4. drop it when the workload does not read the spacecraft attitude from CK (ptr-editor solves its
    own; to be checked with task 4).
+
+**Decision (2026-11-07): option 4 for now.** ptr-editor does not need the spacecraft baseline CK.
+With it dropped (`--drop 'dsk/*' --drop 'ck/juice_sc_*_baseline_*'`; the solar array and MGA
+baselines are type 3 and stay) and a seventh window for tutorial 8's cruise block
+(2025-01-01 → 2025-01-01T01:00), the set is **7.6 MB**, and against it:
+
+- `-m spice` tests: 674 passed (one run had 1 failure that did not come back on rerun, the
+  known parallel SPICE flakiness);
+- tutorials (`--nbmake tutorial --ignore=tutorial/contrib`): 15 passed.
+
+```sh
+qsm reduce 5_1_150lb_23_1_a3 -o tests/data/spice --drop 'dsk/*' --drop 'ck/juice_sc_*_baseline_*' \
+  -w 2025-01-01 2025-01-01T01:00   -w 2032-06-01 2032-06-01T06:00 -w 2032-09-01 2032-10-01 \
+  -w 2032-12-18 2033-01-09         -w 2033-11-24 2033-11-27       -w 2033-12-12 2033-12-12T06:00 \
+  -w 2035-10-05 2035-10-05T06:00
+```
+
+Options 2 or 3 come back if a user of the reduced sets needs the spacecraft CK attitude.
