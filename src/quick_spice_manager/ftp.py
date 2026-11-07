@@ -61,6 +61,31 @@ _SLOT_POLL_INTERVAL_SECONDS = 0.1
 # How long to wait for a free connection slot before giving up.
 _CONNECTION_SLOT_TIMEOUT_SECONDS = 300
 
+# Kernels whose download failed are tried again this many times in all, with a
+# pause of _RETRY_DELAY_SECONDS * attempt in between (a busy server drops
+# connections; it usually answers again after a short wait).
+_DOWNLOAD_ATTEMPTS = 3
+_RETRY_DELAY_SECONDS = 5.0
+
+
+class KernelDownloadError(ConnectionError):
+    """Some kernels of a metakernel could not be downloaded, even after retries.
+
+    ``missing`` holds their paths relative to the kernels directory, and
+    ``errors`` the last error for each of them.
+    """
+
+    def __init__(self, metakernel: Path, missing: dict[str, BaseException]) -> None:
+        self.metakernel = metakernel
+        self.missing = sorted(missing)
+        self.errors = missing
+        listing = "\n".join(f"  {rel}: {missing[rel]}" for rel in self.missing)
+        super().__init__(
+            f"{len(missing)} kernel(s) of {metakernel.name} could not be downloaded "
+            f"from {_FTP_HOST} after {_DOWNLOAD_ATTEMPTS} attempts:\n{listing}\n"
+            "Try again later: kernels already on disk are kept.",
+        )
+
 # ---------------------------------------------------------------------------
 # FTP server and mission path constants
 # ---------------------------------------------------------------------------
@@ -453,8 +478,13 @@ def _ftp_download_file(ftp: ftplib.FTP, remote: str, local: Path) -> None:
     a partially-written file: it sees either the previous complete file (if
     any) or the new complete one, never a truncated in-between state. On any
     failure the temp file is removed and the exception re-raised.
+
+    When the server reports the file size (FTP ``SIZE``), a transfer that
+    ends short of it raises :class:`ftplib.error_temp`, so a dropped data
+    connection never leaves a truncated kernel in the cache.
     """
     local.parent.mkdir(parents=True, exist_ok=True)
+    expected = _remote_size(ftp, remote)
     tmp_fd, tmp_name = tempfile.mkstemp(
         dir=local.parent, prefix=f"{local.name}.", suffix=".part",
     )
@@ -462,10 +492,24 @@ def _ftp_download_file(ftp: ftplib.FTP, remote: str, local: Path) -> None:
     try:
         with os.fdopen(tmp_fd, "wb") as fh:
             ftp.retrbinary(f"RETR {remote}", fh.write)
+        got = tmp_path.stat().st_size
+        if expected is not None and got != expected:
+            msg = f"transfer of {remote} incomplete: {got} of {expected} bytes"
+            raise ftplib.error_temp(msg)
         tmp_path.replace(local)  # atomic rename, same filesystem
     except BaseException:
         tmp_path.unlink(missing_ok=True)
         raise
+
+
+def _remote_size(ftp: ftplib.FTP, remote: str) -> int | None:
+    """Size of *remote* in bytes, or ``None`` when the server does not tell."""
+    try:
+        ftp.voidcmd("TYPE I")  # SIZE is defined for binary transfers
+        size = ftp.size(remote)
+    except ftplib.error_perm:
+        return None
+    return size if isinstance(size, int) else None
 
 
 def _locked_download(
@@ -608,6 +652,10 @@ def download_kernels_via_ftp(
     ConnectionError
         If the ESA FTP server cannot be reached and no usable local cache
         exists for this ``(spacecraft, mk, version)``.
+    KernelDownloadError
+        If some referenced kernels could not be downloaded even after
+        retries (its ``missing`` lists them). Nothing is recorded in the
+        resolution cache, so the next call tries them again.
     FileNotFoundError
         If ``download_kernels=False`` and no complete local cache exists.
     """
@@ -651,6 +699,8 @@ def download_kernels_via_ftp(
         )
     except FileNotFoundError:
         raise  # a genuine "no such kernel/version" answer, not connectivity
+    except KernelDownloadError:
+        raise  # the server answered; some kernels did not come through
     except ftplib.all_errors as exc:
         log.warning(f"FTP: could not reach {_FTP_HOST} ({exc})")
         cached_tm = _usable_cached_tm()
@@ -745,40 +795,67 @@ def _download_kernels_via_ftp_online(
         f"{n_skip} already cached — using {n_workers} parallel connections",
     )
 
-    # --- Parallel download of missing kernels --------------------------------
-    n_dl = n_fail = 0
-    if to_download:
-        futures = {}
-        with ThreadPoolExecutor(max_workers=n_workers) as pool:
-            for remote_kernel, local_kernel in to_download:
-                log.debug(f"FTP: queuing {local_kernel.name}")
-                fut = pool.submit(
-                    _download_one_kernel, _FTP_HOST, remote_kernel, local_kernel,
-                )
-                futures[fut] = local_kernel
-
-            with tqdm(
-                total=len(to_download),
-                desc="Downloading kernels",
-                unit="file",
-                dynamic_ncols=True,
-            ) as pbar:
-                for fut in as_completed(futures):
-                    local_kernel = futures[fut]
-                    exc = fut.exception()
-                    if exc is None:
-                        log.info(f"FTP: downloaded {local_kernel.name}")
-                        n_dl += 1
-                        pbar.set_postfix_str(local_kernel.name, refresh=False)
-                    else:
-                        log.warning(
-                            f"FTP: could not download '{local_kernel.name}': {exc}",
-                        )
-                        n_fail += 1
-                    pbar.update(1)
+    # --- Parallel download of missing kernels, retrying the failed ones -----
+    n_dl = 0
+    failed: dict[str, BaseException] = {}
+    pending = to_download
+    for attempt in range(1, _DOWNLOAD_ATTEMPTS + 1):
+        if not pending:
+            break
+        if attempt > 1:
+            delay = _RETRY_DELAY_SECONDS * (attempt - 1)
+            log.warning(
+                f"FTP: {len(pending)} kernel(s) failed, retrying in {delay:.0f} s "
+                f"(attempt {attempt}/{_DOWNLOAD_ATTEMPTS})",
+            )
+            time.sleep(delay)
+        failed = _download_batch(pending, kernels_dir, n_workers)
+        n_dl += len(pending) - len(failed)
+        pending = [(r, loc) for r, loc in pending if _rel(loc, kernels_dir) in failed]
 
     log.info(
-        f"FTP: done - {n_dl} downloaded, {n_skip} cached, {n_fail} failed",
+        f"FTP: done - {n_dl} downloaded, {n_skip} cached, {len(failed)} failed",
     )
+    if failed:
+        raise KernelDownloadError(local_tm, failed)
 
     return local_tm
+
+
+def _rel(local: Path, kernels_dir: Path) -> str:
+    return local.relative_to(kernels_dir).as_posix()
+
+
+def _download_batch(
+    to_download: list[tuple[str, Path]], kernels_dir: Path, n_workers: int,
+) -> dict[str, BaseException]:
+    """Download *to_download* in parallel; return the failures by relative path."""
+    failed: dict[str, BaseException] = {}
+    futures = {}
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        for remote_kernel, local_kernel in to_download:
+            log.debug(f"FTP: queuing {local_kernel.name}")
+            fut = pool.submit(
+                _download_one_kernel, _FTP_HOST, remote_kernel, local_kernel,
+            )
+            futures[fut] = local_kernel
+
+        with tqdm(
+            total=len(to_download),
+            desc="Downloading kernels",
+            unit="file",
+            dynamic_ncols=True,
+        ) as pbar:
+            for fut in as_completed(futures):
+                local_kernel = futures[fut]
+                exc = fut.exception()
+                if exc is None:
+                    log.info(f"FTP: downloaded {local_kernel.name}")
+                    pbar.set_postfix_str(local_kernel.name, refresh=False)
+                else:
+                    log.warning(
+                        f"FTP: could not download '{local_kernel.name}': {exc}",
+                    )
+                    failed[_rel(local_kernel, kernels_dir)] = exc
+                pbar.update(1)
+    return failed

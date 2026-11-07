@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## Unreleased
 
+### Fixed
+
+- A kernel that fails to download is no longer only a warning (with logging off by default, a silent one) followed by a metakernel returned as if complete, which made SPICE fail later with `SPICE(NOSUCHFILE)`. Failed kernels are tried again (3 attempts in all, with a pause), and if some still fail, `KernelDownloadError` (a `ConnectionError`) lists them in `.missing`. The kernels that did download are kept, and the incomplete resolution is not cached, so the next call fetches only the rest.
+- A transfer that ends short of the size the server reports (FTP `SIZE`) is rejected instead of being kept as a truncated kernel.
+
 ## 0.2.2 - 2026-11-06
 
 ### Added

@@ -83,7 +83,7 @@ _SAMPLE_TM = textwrap.dedent(
                              )
 
     \begintext
-    """
+    """,
 )
 
 
@@ -107,7 +107,7 @@ def test_parse_mk_kernel_paths_no_symbol():
         \begindata
              KERNELS_TO_LOAD = ( 'naif0012.tls' )
         \begintext
-        """
+        """,
     )
     # When there are no PATH_SYMBOLS, the entry is returned as-is
     assert _parse_mk_kernel_paths(tm) == ["naif0012.tls"]
@@ -176,7 +176,7 @@ def test_resolve_tm_versioned_in_mk_dir():
         "/data/SPICE/JUICE/kernels/mk/juice_plan_v462_20260223_001.tm",
     ]
     path = _resolve_tm_on_ftp(
-        ftp, "JUICE", "plan", "/data/SPICE/JUICE/", version="v462_20260223_001"
+        ftp, "JUICE", "plan", "/data/SPICE/JUICE/", version="v462_20260223_001",
     )
     assert path == "/data/SPICE/JUICE/kernels/mk/juice_plan_v462_20260223_001.tm"
     # former_versions should NOT have been listed (found in mk/)
@@ -197,7 +197,7 @@ def test_resolve_tm_versioned_in_former_versions():
         [fv_path],
     ]
     path = _resolve_tm_on_ftp(
-        ftp, "JUICE", "tr03", "/data/SPICE/JUICE/", version="v461_20260121_001"
+        ftp, "JUICE", "tr03", "/data/SPICE/JUICE/", version="v461_20260121_001",
     )
     assert path == fv_path
 
@@ -212,7 +212,7 @@ def test_resolve_tm_versioned_fallback_raises(tmp_path):
     ]
     with pytest.raises(FileNotFoundError, match="v999_99999999_001"):
         _resolve_tm_on_ftp(
-            ftp, "JUICE", "plan", "/data/SPICE/JUICE/", version="v999_99999999_001"
+            ftp, "JUICE", "plan", "/data/SPICE/JUICE/", version="v999_99999999_001",
         )
 
 
@@ -262,7 +262,7 @@ def test_resolve_tm_former_versions_permission_error_raises():
     ]
     with pytest.raises(FileNotFoundError, match="v461_20260121_001"):
         _resolve_tm_on_ftp(
-            ftp, "JUICE", "plan", "/data/SPICE/JUICE/", version="v461_20260121_001"
+            ftp, "JUICE", "plan", "/data/SPICE/JUICE/", version="v461_20260121_001",
         )
 
 
@@ -317,7 +317,7 @@ def test_download_kernels_via_ftp(tmp_path: Path):
                                    '$KERNELS/fk/juice_v45.tf'
                                  )
         \begintext
-        """
+        """,
     ).encode()
 
     tm_remote = "/data/SPICE/JUICE/kernels/mk/juice_plan.tm"
@@ -362,7 +362,7 @@ def test_download_kernels_latest_refreshes_cached_tm(tmp_path: Path):
         \begindata
              KERNELS_TO_LOAD   = ()
         \begintext
-        """
+        """,
     ).encode()
     new_tm_content = textwrap.dedent(
         r"""
@@ -370,7 +370,7 @@ def test_download_kernels_latest_refreshes_cached_tm(tmp_path: Path):
         \begindata
                          KERNELS_TO_LOAD   = ()
         \begintext
-        """
+        """,
     ).encode()
 
     local_tm = tmp_path / "mk" / "juice_plan.tm"
@@ -400,7 +400,7 @@ def test_download_kernels_versioned_keeps_cached_tm(tmp_path: Path):
         \begindata
              KERNELS_TO_LOAD   = ()
         \begintext
-        """
+        """,
     ).encode()
 
     local_tm = tmp_path / "mk" / tm_name
@@ -416,7 +416,7 @@ def test_download_kernels_versioned_keeps_cached_tm(tmp_path: Path):
 
     with patch("quick_spice_manager.ftp.ftplib.FTP", return_value=mock_ftp):
         resolved_tm = download_kernels_via_ftp(
-            "JUICE", "plan", tmp_path, version=version
+            "JUICE", "plan", tmp_path, version=version,
         )
 
     assert resolved_tm == local_tm
@@ -808,7 +808,7 @@ def test_download_kernels_via_ftp_incomplete_cache_reports_missing_kernels(
     tmp_path: Path,
 ):
     """If a cached resolution's .tm file is missing some of its referenced
-    kernels (e.g. a prior download was interrupted) and the server can't be
+    kernels (e.g. deleted after a complete download) and the server can't be
     reached, the resulting error names the missing files."""
     tm_remote = "/data/SPICE/JUICE/kernels/mk/juice_plan.tm"
     tm_with_kernel = textwrap.dedent(
@@ -826,30 +826,21 @@ def test_download_kernels_via_ftp_incomplete_cache_reports_missing_kernels(
 
     mock_ftp = MagicMock()
     mock_ftp.nlst.return_value = [tm_remote]
-
-    def fake_retrbinary(cmd, cb):
-        remote = cmd.split(" ", 1)[1]
-        if remote == tm_remote:
-            cb(tm_with_kernel)
-        else:
-            raise OSError("Network is unreachable")  # kernel download drops
-
-    mock_ftp.retrbinary.side_effect = fake_retrbinary
+    mock_ftp.retrbinary.side_effect = lambda cmd, cb: cb(
+        tm_with_kernel if cmd.endswith(tm_remote) else b"fk",
+    )
 
     with patch("quick_spice_manager.ftp.ftplib.FTP", return_value=mock_ftp):
-        # The .tm downloads fine but its referenced kernel fails -- the
-        # existing partial-failure-tolerant behavior still "succeeds"
-        # overall and records a resolution cache entry.
         download_kernels_via_ftp("JUICE", "plan", tmp_path)
 
-    assert not (tmp_path / "fk" / "juice_v45.tf").exists()
+    (tmp_path / "fk" / "juice_v45.tf").unlink()
 
     with (
         patch(
             "quick_spice_manager.ftp.ftplib.FTP",
             side_effect=OSError("Network is unreachable"),
         ),
-        pytest.raises(ConnectionError, match="incomplete"),
+        pytest.raises(ConnectionError, match=r"incomplete.*fk/juice_v45.tf"),
     ):
         download_kernels_via_ftp("JUICE", "plan", tmp_path)
 
@@ -911,7 +902,7 @@ def test_spice_manager_tour_config_ftp(tmp_path: Path):
              PATH_SYMBOLS      = ( 'KERNELS' )
              KERNELS_TO_LOAD   = ()
         \begintext
-        """
+        """,
     ).encode()
 
     local_tm = tmp_path / "mk" / "juice_plan.tm"
@@ -920,7 +911,7 @@ def test_spice_manager_tour_config_ftp(tmp_path: Path):
 
     mock_ftp = MagicMock()
     mock_ftp.nlst.return_value = [
-        f"/data/SPICE/JUICE/kernels/mk/{local_tm.name}"
+        f"/data/SPICE/JUICE/kernels/mk/{local_tm.name}",
     ]
     mock_ftp.retrbinary.side_effect = lambda cmd, cb: cb(tm_content)
 
@@ -959,3 +950,109 @@ def test_mk_lists():
     from quick_spice_manager.ftp import list_metakernels_via_ftp
     assert list_metakernels_via_ftp('rosetta') == ['ROS_OPS', 'ROS_OPS_V350_20220906_001']
     assert list_metakernels_via_ftp('ROSETTA') == ['ROS_OPS', 'ROS_OPS_V350_20220906_001']
+
+# ---------------------------------------------------------------------------
+# Failed and incomplete kernel downloads
+# ---------------------------------------------------------------------------
+
+_TWO_KERNEL_TM = textwrap.dedent(
+    r"""
+    KPL/MK
+    \begindata
+         PATH_VALUES       = ( '..' )
+         PATH_SYMBOLS      = ( 'KERNELS' )
+         KERNELS_TO_LOAD   = (
+                               '$KERNELS/ck/juice_sc_default_v01.bc'
+                               '$KERNELS/fk/juice_v45.tf'
+                             )
+    \begintext
+    """,
+).encode()
+_TM_REMOTE = "/data/SPICE/JUICE/kernels/mk/juice_plan.tm"
+_CK_REMOTE = "/data/SPICE/JUICE/kernels/ck/juice_sc_default_v01.bc"
+_FK_REMOTE = "/data/SPICE/JUICE/kernels/fk/juice_v45.tf"
+
+
+def _flaky_ftp(ck_failures: int) -> tuple[MagicMock, dict[str, int]]:
+    """A mocked FTP whose CK transfer fails the first *ck_failures* times."""
+    calls = {"ck": 0}
+    data = {_TM_REMOTE: _TWO_KERNEL_TM, _CK_REMOTE: b"ck", _FK_REMOTE: b"fk"}
+
+    def retrbinary(cmd: str, callback):
+        remote = cmd.split(" ", 1)[1]
+        if remote == _CK_REMOTE:
+            calls["ck"] += 1
+            if calls["ck"] <= ck_failures:
+                raise ftplib.error_temp("421 too many connections")
+        callback(data[remote])
+
+    ftp = MagicMock()
+    ftp.nlst.return_value = [_TM_REMOTE]
+    ftp.retrbinary.side_effect = retrbinary
+    ftp.size.side_effect = ftplib.error_perm("550 SIZE not allowed")
+    return ftp, calls
+
+
+def test_failed_kernel_download_is_retried(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(ftp_module, "_RETRY_DELAY_SECONDS", 0)
+    ftp, calls = _flaky_ftp(ck_failures=1)
+
+    with patch("quick_spice_manager.ftp.ftplib.FTP", return_value=ftp):
+        local_tm = download_kernels_via_ftp("JUICE", "plan", tmp_path)
+
+    assert calls["ck"] == 2
+    assert (tmp_path / "ck" / "juice_sc_default_v01.bc").read_bytes() == b"ck"
+    assert local_tm.exists()
+
+
+def test_kernel_that_keeps_failing_raises_and_names_it(tmp_path: Path, monkeypatch):
+    """A kernel that never downloads is an error, not a warning, and the
+    resolution is not cached as complete (the next call tries again)."""
+    monkeypatch.setattr(ftp_module, "_RETRY_DELAY_SECONDS", 0)
+    ftp, calls = _flaky_ftp(ck_failures=99)
+
+    with (
+        patch("quick_spice_manager.ftp.ftplib.FTP", return_value=ftp),
+        pytest.raises(ftp_module.KernelDownloadError) as info,
+    ):
+        download_kernels_via_ftp("JUICE", "plan", tmp_path)
+
+    assert calls["ck"] == ftp_module._DOWNLOAD_ATTEMPTS
+    assert info.value.missing == ["ck/juice_sc_default_v01.bc"]
+    assert "ck/juice_sc_default_v01.bc" in str(info.value)
+    assert isinstance(info.value, ConnectionError)
+    assert (tmp_path / "fk" / "juice_v45.tf").exists()  # the others are kept
+    assert not (tmp_path / ".resolution_cache.json").exists() or (
+        "plan" not in (tmp_path / ".resolution_cache.json").read_text()
+    )
+
+
+def test_kernel_download_error_is_exported():
+    import quick_spice_manager
+
+    assert quick_spice_manager.KernelDownloadError is ftp_module.KernelDownloadError
+
+
+def test_short_transfer_is_rejected(tmp_path: Path):
+    """A transfer that ends before the size the server reported leaves no file."""
+    local = tmp_path / "kernel.bsp"
+    ftp = MagicMock()
+    ftp.size.return_value = 100
+    ftp.retrbinary.side_effect = lambda cmd, cb: cb(b"only-a-part")
+
+    with pytest.raises(ftplib.error_temp, match="11 of 100 bytes"):
+        _ftp_download_file(ftp, "/remote/kernel.bsp", local)
+
+    assert not local.exists()
+    assert list(tmp_path.glob("*.part")) == []
+
+
+def test_transfer_matching_the_reported_size_is_kept(tmp_path: Path):
+    local = tmp_path / "kernel.bsp"
+    ftp = MagicMock()
+    ftp.size.return_value = len(b"kernel-bytes")
+    ftp.retrbinary.side_effect = lambda cmd, cb: cb(b"kernel-bytes")
+
+    _ftp_download_file(ftp, "/remote/kernel.bsp", local)
+
+    assert local.read_bytes() == b"kernel-bytes"
