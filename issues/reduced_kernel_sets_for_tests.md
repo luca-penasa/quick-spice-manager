@@ -7,6 +7,9 @@
 Windows runners pay for it in billed minutes.
 **Kind:** feature. qsm writes the reduced set, and ptr-editor (or any other package) uses it to
 make test data that is committed to the repository, so its tests never download anything.
+**Status (2026-11-07):** tasks 1 and 3 done on branch `reduce-kernels` (`reduce_kernels()`,
+`qsm reduce`, `tests/test_reduce.py`); 2 (CK type 6) open, waiting for a decision; 4 not started.
+See "Status" at the end.
 
 ## Goal
 
@@ -96,3 +99,37 @@ minor bodies, ground stations).
 4. Optional `prune_kernels(mk, check)`.
 5. Tests: subset of a small synthetic SPK/CK written in the test, bit-identical states inside the
    window, `SPICE(SPKINSUFFDATA)` outside it.
+
+## Status (2026-11-07)
+
+Done (branch `reduce-kernels`): `reduce_kernels()` / `qsm reduce` for SPK (every type, `spksub`),
+CK type 3 (records read from the DAF data, written with `ckw03`, interpolation intervals kept),
+binary PCK type 2 (`pckw02`); text kernels and everything else copied whole; drop patterns;
+day padding and merged windows; provenance in the comment areas and the metakernel; a CK whose
+SCLK is undefined is copied whole (the a3 set has one: `juice_swi_scan_zero_v02.bc`, instrument
+-28812, no `CK_-28812_SCLK`). 12 tests on synthetic kernels: SPK and CK bit-identical inside
+the window, PCK to 1e-12, no data outside, CK gaps kept, pool left as it was.
+
+Measured on the a3 set (882 MB, `--drop 'dsk/*'`), against the full set at 400 random epochs
+(566 SPK bodies; JUICE_SPACECRAFT, solar arrays, MGA, ITRF93, IAU frames):
+
+| windows | size | max difference |
+|---------|------|----------------|
+| 2032-12-18 → 2033-01-09 | 29.3 MB | 6e-8 km (a ground station, via ITRF93); frames 0, ITRF93 9e-12 |
+| the six ptr-editor windows | 31.9 MB | 0 (checked in 2032-09-02 → 2032-09-30) |
+
+ptr-editor's `-m spice` tests (674) pass against the six-window set (`SPICE_METAKERNEL`
+pointing at it), in 63 s instead of 140 s with the full set.
+
+**CK type 6 (task 2) decides the size**: the baseline attitude CK
+(`juice_sc_crema_..._baseline_v02.bc`, one type 6 segment over the whole mission) is 24.5 of the
+29 MB, and it *is* the spacecraft attitude (dropping it changes JUICE_SPACECRAFT by up to 1.8 in
+the rotation matrix). spiceypy wraps neither `ckw06_c` nor the low-level DAF writers
+(`dafbna`/`dafada`/`dafena`), so an exact subset needs a small DAF writer of our own (the
+type 6 layout: mini-segments, their interval bounds and directory). Options:
+
+1. copy it whole (now): 24.5 MB in the repository;
+2. write the DAF ourselves and keep the mini-segments covering the windows: exact, a few hundred KB;
+3. resample to type 3 inside the windows with a stated tolerance: lossy, simpler;
+4. drop it when the workload does not read the spacecraft attitude from CK (ptr-editor solves its
+   own; to be checked with task 4).

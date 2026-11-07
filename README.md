@@ -51,6 +51,8 @@ qsm list -s juice --filter plan     # metakernels on the ESA FTP server
 qsm download plan -s juice          # download the metakernel and its kernels
 qsm resolve plan -s juice           # same, then print a furnshable metakernel path
 qsm info plan -s juice              # what's cached, without using the network
+qsm reduce plan -w 2032-12-18 2033-01-09 -o test_kernels --drop 'dsk/*'
+                                    # a copy holding only that time window
 qsm cache list                      # size and location of each cached mission
 qsm cache clear juice               # delete a mission's cached kernels
 ```
@@ -185,6 +187,45 @@ spread over unrelated trees get one symbol per directory. Strings longer than
 SPICE's 80-character limit are split with `+` continuation. When the pool's
 metakernel is known, its `SKD_VERSION` / `MK_IDENTIFIER` are copied into the
 snapshot, and the kernels loaded on top of it are listed in its comments.
+
+### Reduced kernel sets (test data)
+
+`reduce_kernels` writes a copy of a metakernel and its kernels that holds only
+the data inside some time windows, for example test data small enough to commit
+to a repository:
+
+```python
+from quick_spice_manager import reduce_kernels
+
+result = reduce_kernels(
+    "5_1_150lb_23_1_a3",
+    windows=[("2032-12-18", "2033-01-09"), ("2032-09-01", "2032-10-01")],
+    out_dir="tests/data/spice",
+    drop=["dsk/*"],               # kernels the workload does not need
+)
+print(result.summary())           # what happened to each kernel, and the sizes
+QuickSpiceManager(mk=result.metakernel).load_kernels()
+```
+
+The data inside the windows is copied, not resampled, so the reduced set gives
+the same answers there:
+
+| kernel | written |
+|--------|---------|
+| SPK, every type | the records covering each window (`spksub`) |
+| CK type 3 | the pointing records covering each window, with their interpolation intervals |
+| binary PCK type 2 | the Chebyshev records covering each window (equal to rounding) |
+| anything else | copied whole: text kernels, DSKs, CKs of other types (spiceypy cannot write type 6), a CK whose SCLK is not defined |
+
+Each window is padded by a day (`pad=`, in seconds), so interpolation and
+extrapolation near its edges still work; overlapping windows are merged. A
+binary kernel without data in any window is left out. The reduced metakernel
+(`out_dir/mk/<name>.tm`, `PATH_VALUES = ( '..' )`, the layout of ESA's) and each
+reduced kernel's comment area record the source and the windows; the kernels
+keep their own comments.
+
+For JUICE's `juice_crema_5_1_150lb_23_1_a3` (882 MB), a 24-day window without
+the DSKs is 29 MB, 24.5 MB of which is the type 6 attitude CK, copied whole.
 
 ### Pool management
 

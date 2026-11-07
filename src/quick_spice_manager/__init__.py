@@ -32,9 +32,16 @@ def log_disable(mod: str = "quick_spice_manager") -> None:
 
 
 from .ftp import KernelDownloadError
+from .reduce import reduce_kernels
 from .spice_manager import QuickSpiceManager, snapshot_pool
 
-__all__ = ["KernelDownloadError", "QuickSpiceManager", "SpiceManager", "snapshot_pool"]
+__all__ = [
+    "KernelDownloadError",
+    "QuickSpiceManager",
+    "SpiceManager",
+    "reduce_kernels",
+    "snapshot_pool",
+]
 
 
 def __getattr__(name: str) -> object:

@@ -23,6 +23,7 @@ from .ftp import (
     _ftp_base,
     list_metakernels_via_ftp,
 )
+from .reduce import DEFAULT_PAD_SECONDS, _reduce_with
 from .spice_manager import (
     QuickSpiceManager,
     _lookup_localized,
@@ -267,6 +268,63 @@ def info(sm: QuickSpiceManager, *, as_json: bool) -> None:
         return
     for key, value in fields.items():
         click.echo(f"{key + ':':<15}{'-' if value is None else value}")
+
+
+@cli.command()
+@_kernel_options()
+@click.option(
+    "-w",
+    "--window",
+    "windows",
+    nargs=2,
+    multiple=True,
+    required=True,
+    metavar="START STOP",
+    help="A time window (UTC, anything str2et reads); repeat for more.",
+)
+@click.option(
+    "-o",
+    "--output",
+    "out_dir",
+    required=True,
+    type=click.Path(file_okay=False, path_type=Path),
+    help="Directory for the reduced kernels and mk/<name>.tm.",
+)
+@click.option(
+    "--drop",
+    multiple=True,
+    metavar="GLOB",
+    help="Leave out kernels whose relative path matches, e.g. 'dsk/*'; repeat for more.",
+)
+@click.option(
+    "--pad",
+    type=float,
+    default=DEFAULT_PAD_SECONDS,
+    show_default=True,
+    help="Seconds added before and after each window.",
+)
+@click.option("--name", help="Stem of the reduced metakernel [default: <source>_reduced].")
+def reduce(  # noqa: PLR0913 - one option each
+    sm: QuickSpiceManager,
+    windows: tuple[tuple[str, str], ...],
+    out_dir: Path,
+    drop: tuple[str, ...],
+    pad: float,
+    name: str | None,
+) -> None:
+    """Write a copy of a metakernel holding only the data inside time windows.
+
+    SPKs, type 3 CKs and type 2 binary PCKs keep the records covering the
+    windows, so the reduced set gives the same answers there. Other kernels
+    are copied whole, binary kernels without data in the windows are left
+    out. Prints what happened to each kernel; the metakernel path is the
+    last line on stdout.
+
+        qsm reduce 5_1_150lb_23_1_a3 -w 2032-12-18 2033-01-09 -o tests/data/spice --drop 'dsk/*'
+    """
+    result = _reduce_with(sm, windows, out_dir, drop=drop, pad=pad, name=name)
+    click.echo(result.summary(), err=True)
+    click.echo(result.metakernel.resolve())
 
 
 @cli.group()
