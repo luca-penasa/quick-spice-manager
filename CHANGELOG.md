@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## Unreleased
 
+## 0.2.4 - 2026-11-07
+
 ### Added
 
 - `reduce_kernels()` and `qsm reduce`: a copy of a metakernel holding only the data inside some time windows, for test data small enough to commit. SPKs, type 3 CKs and type 2 binary PCKs keep the records covering the windows (the same answers there); other kernels are copied whole, binary kernels without data in the windows are left out, and `drop=` leaves out kernels by pattern. Each window is padded by a day. The output records its provenance in the comment areas.
