@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## Unreleased
 
+### Fixed
+
+- An unreachable ESA FTP server (e.g. port 21 blocked) no longer blocks every metakernel resolution for about two minutes, the operating system's connect timeout. A short TCP probe (3 s, `QSM_FTP_PROBE_TIMEOUT`) checks the server before any FTP connection, and its answer is remembered in the process for 2 minutes (`QSM_FTP_RETRY_AFTER`), so later managers go straight to the cached kernels. FTP connections time out after 30 s of silence (`QSM_FTP_TIMEOUT`). The "could not reach" warning gives the time spent and how to avoid the check, and is logged once, not for every manager.
+
+### Added
+
+- `QSM_OFFLINE=1`: never touch the network, everywhere, as with `download_kernels=False`.
+- `QSM_LATEST_MAX_AGE`: seconds a `version="latest"` resolution verified online is reused without asking the server (default 0, checking on every call as before).
+
 ## 0.2.4 - 2026-11-07
 
 ### Added

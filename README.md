@@ -446,12 +446,21 @@ library degrades gracefully instead of hard-failing when there's no network:
   tag (e.g. `version="v462_20260223_001"`) has been fully resolved and
   downloaded, later calls for the same spacecraft/`mk`/version skip the FTP
   server entirely — a pinned version tag never changes once published.
-* **`version="latest"` (the default) always tries a live check first** — its
+* **`version="latest"` (the default) tries a live check first** — its
   whole point is to discover newly published kernels, so it never silently
   serves stale data while online. Only if the ESA FTP server truly can't be
   reached (DNS failure, timeout, connection refused, etc.) does it fall back
   to the last fully-verified local resolution, logging a warning that the
-  result may not reflect the newest kernels.
+  result may not reflect the newest kernels. Set `QSM_LATEST_MAX_AGE` to
+  reuse a resolution verified online less than that many seconds ago without
+  asking the server; kernels published in the meantime are picked up at the
+  next check.
+* **An unreachable server costs a few seconds, once.** Before connecting,
+  a short TCP probe checks that the server answers, and the answer is
+  remembered in the process for 2 minutes: on a network that blocks the
+  server, the first manager waits for the probe and the next ones go straight
+  to the cache. Real FTP connections time out too, instead of waiting for the
+  operating system's connect timeout (about two minutes on Linux).
 * **`sm.metakernels` (the list of available metakernels)** gets the same
   treatment: cached after each successful listing, reused with a warning if
   the server can't be reached.
@@ -463,6 +472,17 @@ library degrades gracefully instead of hard-failing when there's no network:
 This is transparent — no configuration needed — and lives alongside the
 regular kernel cache (`<kernels_dir>/.resolution_cache.json`), so
 `clear_cache()` clears it too.
+
+These environment variables tune it (read on each call, so setting
+`os.environ` in a running notebook works):
+
+| Variable | Default | Effect |
+|---|---|---|
+| `QSM_OFFLINE` | unset | `1` never touches the network, everywhere (like `download_kernels=False`): resolve from the cache, or fail clearly. For air-gapped machines and CI. |
+| `QSM_LATEST_MAX_AGE` | `0` | Seconds a `"latest"` resolution verified online is reused without asking the server. `0` checks on every call. |
+| `QSM_FTP_PROBE_TIMEOUT` | `3` | Seconds the reachability probe waits for the server. |
+| `QSM_FTP_RETRY_AFTER` | `120` | Seconds the probe's answer is remembered in the process. |
+| `QSM_FTP_TIMEOUT` | `30` | Seconds each FTP socket operation may wait (a limit on silence, not on the length of a download). |
 
 ## Development
 

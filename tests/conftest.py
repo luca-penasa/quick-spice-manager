@@ -30,6 +30,32 @@ def _isolate_ftp_connection_lock_dir(tmp_path_factory, monkeypatch):
     )
 
 
+@pytest.fixture(autouse=True)
+def _isolate_ftp_reachability(request, monkeypatch):
+    """Start every test with no remembered reachability and no QSM_* settings,
+    and, unless the test is marked ``real_probe`` or ``integration``, with a
+    probe that always finds the server reachable.
+
+    Without the probe patch, the tests that mock ``ftplib.FTP`` would still
+    open a real TCP connection to the ESA server before each mocked one.
+    """
+    import os
+
+    from quick_spice_manager import ftp
+
+    for name in list(os.environ):
+        if name.startswith("QSM_"):
+            monkeypatch.delenv(name)
+    ftp._reset_reachability()
+    if not (
+        request.node.get_closest_marker("real_probe")
+        or request.node.get_closest_marker("integration")
+    ):
+        monkeypatch.setattr(ftp, "_probe_ftp_server", lambda timeout: None)
+    yield
+    ftp._reset_reachability()
+
+
 def pytest_addoption(parser: pytest.Parser) -> None:
     parser.addoption(
         "--integration",

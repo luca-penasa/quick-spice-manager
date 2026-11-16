@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import contextlib
 import ftplib
+import json
+import socket
 import textwrap
 import threading
 import time
@@ -17,6 +19,7 @@ import filelock
 import pytest
 
 from quick_spice_manager import ftp as ftp_module
+from quick_spice_manager.dirs import get_resolution_cache_path
 from quick_spice_manager.ftp import (
     _MISSION_FTP_BASE,
     _canonical_mission,
@@ -546,7 +549,7 @@ def test_download_one_kernel_routes_through_locked_download(tmp_path: Path):
     mock_ftp = MagicMock()
 
     with patch("quick_spice_manager.ftp.ftplib.FTP", return_value=mock_ftp):
-        _download_one_kernel("spiftp.esac.esa.int", "/remote/kernel.bsp", local)
+        _download_one_kernel("/remote/kernel.bsp", local)
 
     mock_ftp.retrbinary.assert_not_called()
     assert local.read_bytes() == b"already-here"
@@ -621,7 +624,7 @@ def test_download_one_kernel_uses_connection_slot(tmp_path: Path):
         ) as mock_slot,
         patch("quick_spice_manager.ftp.ftplib.FTP", return_value=mock_ftp),
     ):
-        _download_one_kernel("host", "/remote/kernel.bsp", local)
+        _download_one_kernel("/remote/kernel.bsp", local)
 
     mock_slot.assert_called_once()
 
@@ -946,6 +949,7 @@ def test_spice_manager_tour_config_ftp(tmp_path: Path):
 
 
 
+@pytest.mark.integration
 def test_mk_lists():
     from quick_spice_manager.ftp import list_metakernels_via_ftp
     assert list_metakernels_via_ftp('rosetta') == ['ROS_OPS', 'ROS_OPS_V350_20220906_001']
@@ -1056,3 +1060,269 @@ def test_transfer_matching_the_reported_size_is_kept(tmp_path: Path):
     _ftp_download_file(ftp, "/remote/kernel.bsp", local)
 
     assert local.read_bytes() == b"kernel-bytes"
+
+
+# ---------------------------------------------------------------------------
+# Reachability probe, timeouts, offline switch, freshness window for 'latest'
+#
+# No real network: the "server" is a local port that refuses connections
+# (nothing listening) or accepts them and never sends the FTP greeting (a
+# listening socket nobody accepts on -- the kernel completes the TCP handshake
+# anyway).
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def refusing_server(monkeypatch):
+    """Point the FTP module at a local port with nothing listening."""
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    monkeypatch.setattr(ftp_module, "_FTP_HOST", "127.0.0.1")
+    monkeypatch.setattr(ftp_module, "_FTP_PORT", port)
+
+
+@pytest.fixture
+def silent_server(monkeypatch):
+    """Point the FTP module at a local port that connects but never answers."""
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    sock.listen(16)
+    monkeypatch.setattr(ftp_module, "_FTP_HOST", "127.0.0.1")
+    monkeypatch.setattr(ftp_module, "_FTP_PORT", sock.getsockname()[1])
+    yield
+    sock.close()
+
+
+@pytest.fixture
+def probe_counter(monkeypatch):
+    """Count calls of the probe, keeping whatever probe is in place."""
+    calls = {"n": 0}
+    inner = ftp_module._probe_ftp_server
+
+    def counting(timeout: float) -> None:
+        calls["n"] += 1
+        inner(timeout)
+
+    monkeypatch.setattr(ftp_module, "_probe_ftp_server", counting)
+    return calls
+
+
+@pytest.fixture
+def log_records():
+    from loguru import logger
+
+    records: list[tuple[str, str]] = []
+    logger.enable("quick_spice_manager")  # disabled by default on import
+    handler = logger.add(
+        lambda m: records.append((m.record["level"].name, m.record["message"])),
+        level="DEBUG",
+    )
+    yield records
+    logger.remove(handler)
+    logger.disable("quick_spice_manager")
+
+
+def _seed_resolution(
+    kernels_dir: Path, *, checked_at: float | None = None, tm: bytes = _EMPTY_TM,
+) -> Path:
+    """Write a cached 'latest' resolution of JUICE 'plan', as a past call would."""
+    local_tm = kernels_dir / "mk" / "juice_plan.tm"
+    local_tm.parent.mkdir(parents=True, exist_ok=True)
+    local_tm.write_bytes(tm)
+    key = ftp_module._resolution_cache_key("JUICE", "plan", "latest")
+    entry = {
+        "local_tm": "mk/juice_plan.tm",
+        "checked_at": time.time() if checked_at is None else checked_at,
+    }
+    get_resolution_cache_path(kernels_dir).write_text(json.dumps({key: entry}))
+    return local_tm
+
+
+def _online_ftp() -> MagicMock:
+    mock_ftp = MagicMock()
+    mock_ftp.nlst.return_value = ["/data/SPICE/JUICE/kernels/mk/juice_plan.tm"]
+    mock_ftp.retrbinary.side_effect = lambda cmd, cb: cb(_EMPTY_TM)
+    return mock_ftp
+
+
+@pytest.mark.real_probe
+def test_unreachable_server_falls_back_without_opening_ftp(
+    tmp_path: Path, refusing_server,
+):
+    seeded = _seed_resolution(tmp_path)
+    start = time.monotonic()
+    with patch("quick_spice_manager.ftp.ftplib.FTP") as ftp_cls:
+        result = download_kernels_via_ftp("JUICE", "plan", tmp_path)
+    assert result == seeded
+    assert time.monotonic() - start < 2
+    ftp_cls.assert_not_called()
+
+
+@pytest.mark.real_probe
+def test_probe_uses_the_configured_timeout(tmp_path: Path, monkeypatch):
+    """A probe whose SYN is dropped gives up after QSM_FTP_PROBE_TIMEOUT."""
+    seen: dict[str, float] = {}
+
+    def dropped(address, timeout):
+        seen["timeout"] = timeout
+        raise TimeoutError("timed out")
+
+    monkeypatch.setenv("QSM_FTP_PROBE_TIMEOUT", "0.5")
+    monkeypatch.setattr(ftp_module.socket, "create_connection", dropped)
+    seeded = _seed_resolution(tmp_path)
+    assert download_kernels_via_ftp("JUICE", "plan", tmp_path) == seeded
+    assert seen["timeout"] == 0.5
+
+
+@pytest.mark.real_probe
+def test_unreachable_server_is_remembered(
+    tmp_path: Path, refusing_server, probe_counter, monkeypatch,
+):
+    _seed_resolution(tmp_path)
+    download_kernels_via_ftp("JUICE", "plan", tmp_path)
+    download_kernels_via_ftp("JUICE", "plan", tmp_path)
+    with pytest.raises(ConnectionError):  # nothing cached for the listing
+        list_metakernels_via_ftp("JUICE")
+    assert probe_counter["n"] == 1
+
+    monkeypatch.setenv("QSM_FTP_RETRY_AFTER", "0")  # the memo has expired
+    download_kernels_via_ftp("JUICE", "plan", tmp_path)
+    assert probe_counter["n"] == 2
+
+
+@pytest.mark.real_probe
+def test_server_that_never_greets_times_out(
+    tmp_path: Path, silent_server, monkeypatch,
+):
+    """The probe connects, but the FTP greeting never comes: the connection
+    times out after QSM_FTP_TIMEOUT, falls back to the cache, and the server
+    is remembered as unreachable."""
+    monkeypatch.setenv("QSM_FTP_TIMEOUT", "0.3")
+    seeded = _seed_resolution(tmp_path)
+    start = time.monotonic()
+    assert download_kernels_via_ftp("JUICE", "plan", tmp_path) == seeded
+    assert time.monotonic() - start < 3
+    assert ftp_module._reachability is not None
+    assert not ftp_module._reachability.ok
+
+
+@pytest.mark.real_probe
+def test_unreachable_server_without_cache_raises(tmp_path: Path, refusing_server):
+    with pytest.raises(ConnectionError, match="unreachable"):
+        download_kernels_via_ftp("JUICE", "plan", tmp_path)
+
+
+def test_ftp_connections_get_a_timeout(tmp_path: Path, monkeypatch):
+    with patch("quick_spice_manager.ftp.ftplib.FTP", return_value=_online_ftp()) as cls:
+        download_kernels_via_ftp("JUICE", "plan", tmp_path)
+    assert cls.call_args.kwargs["timeout"] == ftp_module._DEFAULT_FTP_TIMEOUT_SECONDS
+
+    monkeypatch.setenv("QSM_FTP_TIMEOUT", "7")
+    with patch("quick_spice_manager.ftp.ftplib.FTP", return_value=_online_ftp()) as cls:
+        download_kernels_via_ftp("JUICE", "plan", tmp_path)
+    assert cls.call_args.kwargs["timeout"] == 7.0
+
+
+def test_ftp_level_refusal_does_not_mark_server_unreachable(
+    tmp_path: Path, monkeypatch,
+):
+    """A busy server ("421 too many connections") is still reachable."""
+    monkeypatch.setattr(ftp_module, "_RETRY_DELAY_SECONDS", 0)
+    ftp, _ = _flaky_ftp(ck_failures=99)
+    with (
+        patch("quick_spice_manager.ftp.ftplib.FTP", return_value=ftp),
+        pytest.raises(ftp_module.KernelDownloadError),
+    ):
+        download_kernels_via_ftp("JUICE", "plan", tmp_path)
+    assert ftp_module._reachability is not None
+    assert ftp_module._reachability.ok
+
+
+def test_concurrent_callers_share_one_probe(monkeypatch):
+    calls = {"n": 0}
+
+    def slow_probe(timeout: float) -> None:
+        calls["n"] += 1
+        time.sleep(0.2)
+
+    monkeypatch.setattr(ftp_module, "_probe_ftp_server", slow_probe)
+    threads = [
+        threading.Thread(target=ftp_module._ensure_ftp_reachable) for _ in range(4)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5)
+    assert calls["n"] == 1
+
+
+def test_offline_switch_uses_cache_only(tmp_path: Path, monkeypatch, probe_counter):
+    monkeypatch.setenv("QSM_OFFLINE", "1")
+    seeded = _seed_resolution(tmp_path)
+    with patch("quick_spice_manager.ftp.ftplib.FTP") as ftp_cls:
+        assert download_kernels_via_ftp("JUICE", "plan", tmp_path) == seeded
+        with pytest.raises(FileNotFoundError, match="QSM_OFFLINE"):
+            download_kernels_via_ftp("JUICE", "plan", tmp_path / "empty")
+        with pytest.raises(ConnectionError):
+            list_metakernels_via_ftp("JUICE")
+    ftp_cls.assert_not_called()
+    assert probe_counter["n"] == 0
+
+
+def test_offline_switch_uses_cached_listing(monkeypatch):
+    with patch("quick_spice_manager.ftp.ftplib.FTP", return_value=_online_ftp()):
+        online = list_metakernels_via_ftp("JUICE")
+    monkeypatch.setenv("QSM_OFFLINE", "1")
+    with patch("quick_spice_manager.ftp.ftplib.FTP") as ftp_cls:
+        assert list_metakernels_via_ftp("JUICE") == online
+    ftp_cls.assert_not_called()
+
+
+def test_fresh_latest_resolution_skips_the_server(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("QSM_LATEST_MAX_AGE", "3600")
+    seeded = _seed_resolution(tmp_path, checked_at=time.time() - 60)
+    with patch("quick_spice_manager.ftp.ftplib.FTP") as ftp_cls:
+        assert download_kernels_via_ftp("JUICE", "plan", tmp_path) == seeded
+    ftp_cls.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("max_age", "age", "tm"),
+    [
+        ("0", 60, _EMPTY_TM),          # default: always check
+        ("3600", 7200, _EMPTY_TM),     # stale
+        ("3600", 60, _TWO_KERNEL_TM),  # fresh but incomplete
+    ],
+)
+def test_latest_resolution_is_checked_online(
+    tmp_path: Path, monkeypatch, max_age: str, age: float, tm: bytes,
+):
+    monkeypatch.setenv("QSM_LATEST_MAX_AGE", max_age)
+    _seed_resolution(tmp_path, checked_at=time.time() - age, tm=tm)
+    with patch("quick_spice_manager.ftp.ftplib.FTP", return_value=_online_ftp()) as cls:
+        download_kernels_via_ftp("JUICE", "plan", tmp_path)
+    cls.assert_called()
+
+
+def test_malformed_setting_falls_back_to_default(monkeypatch):
+    monkeypatch.setenv("QSM_FTP_TIMEOUT", "soon")
+    assert ftp_module._env_seconds("QSM_FTP_TIMEOUT", 30.0) == 30.0
+    monkeypatch.setenv("QSM_FTP_TIMEOUT", "-1")
+    assert ftp_module._env_seconds("QSM_FTP_TIMEOUT", 30.0) == 30.0
+
+
+@pytest.mark.real_probe
+def test_unreachable_warning_says_how_long_and_how_to_avoid_it(
+    tmp_path: Path, refusing_server, log_records,
+):
+    _seed_resolution(tmp_path)
+    download_kernels_via_ftp("JUICE", "plan", tmp_path)
+    warnings = [m for level, m in log_records if level == "WARNING"]
+    assert any("after" in m and "QSM_OFFLINE=1" in m for m in warnings)
+
+    log_records.clear()
+    download_kernels_via_ftp("JUICE", "plan", tmp_path)  # remembered: no warning
+    assert not [m for level, m in log_records if level == "WARNING"]
+    assert any("skipping the server" in m for _, m in log_records)

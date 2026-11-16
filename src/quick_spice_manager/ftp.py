@@ -13,9 +13,12 @@ import ftplib
 import json
 import os
 import re
+import socket
 import tempfile
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -66,6 +69,175 @@ _CONNECTION_SLOT_TIMEOUT_SECONDS = 300
 # connections; it usually answers again after a short wait).
 _DOWNLOAD_ATTEMPTS = 3
 _RETRY_DELAY_SECONDS = 5.0
+
+# Reachability and timeouts. Each default can be overridden by the environment
+# variable named next to it, read at call time (so setting os.environ in a
+# notebook after the import works).
+#
+# Before any FTP connection, a plain TCP connect to the server ("probe") checks
+# that it answers at all; its result is remembered in the process for
+# QSM_FTP_RETRY_AFTER seconds, so on a network where the server is unreachable
+# a whole session pays the probe timeout once instead of the OS connect timeout
+# (about two minutes on Linux) for every manager.
+_DEFAULT_PROBE_TIMEOUT_SECONDS = 3.0     # QSM_FTP_PROBE_TIMEOUT
+# Per socket operation on real FTP connections (connect, each read and write,
+# data connections too), not a cap on a whole transfer.
+_DEFAULT_FTP_TIMEOUT_SECONDS = 30.0      # QSM_FTP_TIMEOUT
+_DEFAULT_RETRY_AFTER_SECONDS = 120.0     # QSM_FTP_RETRY_AFTER
+# How long a 'latest' resolution verified online is reused without checking
+# the server again; 0 checks on every call.
+_DEFAULT_LATEST_MAX_AGE_SECONDS = 0.0    # QSM_LATEST_MAX_AGE
+
+_FTP_PORT = 21
+
+_AVOID_NETWORK_HINT = (
+    "To skip the network: set QSM_OFFLINE=1, pass a local .tm path, "
+    "or set SPICE_METAKERNEL."
+)
+
+
+def _env_seconds(name: str, default: float) -> float:
+    """A non-negative number of seconds from environment variable *name*."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        value = -1.0
+    if value < 0:
+        log.warning(f"{name}={raw!r} is not a number of seconds; using {default}")
+        return default
+    return value
+
+
+def _offline() -> bool:
+    """Whether QSM_OFFLINE asks never to touch the network."""
+    return os.environ.get("QSM_OFFLINE", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+class FtpUnreachableError(OSError):
+    """The ESA FTP server did not answer (or did not, recently).
+
+    An :class:`OSError`, so it takes the same offline fallback as any other
+    connection failure. ``remembered`` is true when no attempt was made because
+    the server was found unreachable earlier in this process.
+    """
+
+    def __init__(self, reason: str, *, remembered: bool = False) -> None:
+        super().__init__(reason)
+        self.remembered = remembered
+
+
+@dataclass(frozen=True)
+class _Reachability:
+    ok: bool
+    checked_at: float
+    reason: str = ""
+
+
+# The last reachability result in this process, shared by every manager and
+# thread; the lock makes concurrent callers wait for one probe.
+_reachability: _Reachability | None = None
+_reachability_lock = threading.Lock()
+
+
+def _reset_reachability() -> None:
+    """Forget the remembered reachability result (the next call probes)."""
+    global _reachability  # noqa: PLW0603 - process-wide memo by design
+    with _reachability_lock:
+        _reachability = None
+
+
+def _probe_ftp_server(timeout: float) -> None:
+    """Open and close a TCP connection to the FTP server; raise ``OSError`` if not."""
+    socket.create_connection((_FTP_HOST, _FTP_PORT), timeout=timeout).close()
+
+
+def _unreachable_reason(exc: BaseException, elapsed: float, now: float) -> str:
+    retry_at = datetime.fromtimestamp(
+        now + _env_seconds("QSM_FTP_RETRY_AFTER", _DEFAULT_RETRY_AFTER_SECONDS),
+    ).strftime("%H:%M:%S")
+    detail = str(exc) or type(exc).__name__
+    return (
+        f"{_FTP_HOST}:{_FTP_PORT} unreachable ({detail}, after {elapsed:.1f} s); "
+        f"not trying again before {retry_at}"
+    )
+
+
+def _mark_unreachable(exc: BaseException, elapsed: float) -> None:
+    """Remember that a real connection to the server failed."""
+    global _reachability  # noqa: PLW0603 - process-wide memo by design
+    now = time.time()
+    with _reachability_lock:
+        _reachability = _Reachability(False, now, _unreachable_reason(exc, elapsed, now))
+
+
+def _ensure_ftp_reachable() -> None:
+    """Return if the FTP server answers, else raise :class:`FtpUnreachableError`.
+
+    Uses the result remembered in this process when it is younger than
+    QSM_FTP_RETRY_AFTER; otherwise probes (see :func:`_probe_ftp_server`)
+    and remembers the outcome, good or bad.
+    """
+    global _reachability  # noqa: PLW0603 - process-wide memo by design
+    retry_after = _env_seconds("QSM_FTP_RETRY_AFTER", _DEFAULT_RETRY_AFTER_SECONDS)
+    with _reachability_lock:
+        known = _reachability
+        if known is not None and time.time() - known.checked_at < retry_after:
+            if known.ok:
+                return
+            raise FtpUnreachableError(known.reason, remembered=True)
+        timeout = _env_seconds("QSM_FTP_PROBE_TIMEOUT", _DEFAULT_PROBE_TIMEOUT_SECONDS)
+        start = time.monotonic()
+        try:
+            _probe_ftp_server(timeout)
+        except OSError as exc:
+            now = time.time()
+            reason = _unreachable_reason(exc, time.monotonic() - start, now)
+            _reachability = _Reachability(False, now, reason)
+            raise FtpUnreachableError(reason) from exc
+        _reachability = _Reachability(True, time.time())
+
+
+def _connect_ftp() -> ftplib.FTP:
+    """An anonymous, logged-in connection to the ESA FTP server, with timeouts.
+
+    Checks reachability first (:func:`_ensure_ftp_reachable`). A connect that
+    fails at the socket level marks the server unreachable for the process; an
+    FTP-level refusal (e.g. ``421 too many connections``) does not.
+    """
+    _ensure_ftp_reachable()
+    ftp = ftplib.FTP(timeout=_env_seconds("QSM_FTP_TIMEOUT", _DEFAULT_FTP_TIMEOUT_SECONDS))  # noqa: S321 - public ESA FTP
+    start = time.monotonic()
+    try:
+        ftp.connect(_FTP_HOST, _FTP_PORT)  # also reads the server's greeting
+    except OSError as exc:  # ftplib.Error (an FTP reply) is not an OSError
+        _mark_unreachable(exc, time.monotonic() - start)
+        ftp.close()
+        raise
+    except BaseException:
+        ftp.close()
+        raise
+    try:
+        ftp.login()
+    except BaseException:
+        ftp.close()
+        raise
+    return ftp
+
+
+def _could_not_reach(exc: BaseException, elapsed: float) -> None:
+    """Log a failed attempt to reach the server: once in full, then briefly."""
+    if isinstance(exc, FtpUnreachableError) and exc.remembered:
+        log.info(f"FTP: skipping the server ({exc})")
+        return
+    log.warning(
+        f"FTP: could not reach {_FTP_HOST} after {elapsed:.1f} s ({exc}). "
+        f"{_AVOID_NETWORK_HINT}",
+    )
 
 
 class KernelDownloadError(ConnectionError):
@@ -269,18 +441,21 @@ def list_metakernels_via_ftp(mission: str) -> list[str]:
         get_metakernel_listing_cache_dir() / f"{_canonical_mission(mission)}.json"
     )
 
+    start = time.monotonic()
     try:
+        if _offline():
+            raise FtpUnreachableError("QSM_OFFLINE is set", remembered=True)
+        _ensure_ftp_reachable()  # before waiting for a connection slot
         with _ftp_connection_slot():
-            ftp = ftplib.FTP(_FTP_HOST)  # noqa: S321 - public ESA FTP, anonymous login
+            ftp = _connect_ftp()
             try:
-                ftp.login()
                 entries = ftp.nlst(mk_dir)
             finally:
                 ftp.quit()
     except FileNotFoundError:
         raise  # a genuine "no such directory" answer, not a connectivity issue
     except ftplib.all_errors as exc:
-        log.warning(f"FTP: could not reach {_FTP_HOST} ({exc})")
+        _could_not_reach(exc, time.monotonic() - start)
         cached = _read_json_cache(cache_path)
         if cached.get("entries"):
             when = _format_checked_at(cached.get("checked_at"))
@@ -541,7 +716,7 @@ def _locked_download(
         return True
 
 
-def _download_one_kernel(host: str, remote: str, local: Path) -> None:
+def _download_one_kernel(remote: str, local: Path) -> None:
     """
     Open a fresh anonymous FTP connection, download *remote* to *local*, then close.
 
@@ -551,9 +726,8 @@ def _download_one_kernel(host: str, remote: str, local: Path) -> None:
     bounding total concurrent connections machine-wide.
     """
     with _ftp_connection_slot():
-        ftp = ftplib.FTP(host)  # noqa: S321 - public ESA FTP, anonymous login
+        ftp = _connect_ftp()
         try:
-            ftp.login()
             _locked_download(ftp, remote, local)
         finally:
             ftp.quit()
@@ -607,12 +781,21 @@ def download_kernels_via_ftp(
       once published: if a previous call already fully resolved and
       downloaded this exact ``(spacecraft, mk, version)``, the network is
       skipped entirely on subsequent calls.
-    * **``version='latest'``** always attempts a live check first (its
-      whole point is to discover newly published kernels). Only if the ESA
-      FTP server cannot be reached at all (DNS failure, timeout, connection
-      refused, etc.) does it fall back to the last fully-verified cached
-      resolution -- with a warning logged, since that may not reflect the
-      newest kernels.
+    * **``version='latest'``** attempts a live check first (its whole point
+      is to discover newly published kernels), unless the cached resolution
+      was verified online less than ``QSM_LATEST_MAX_AGE`` seconds ago
+      (default 0: always check). Only if the ESA FTP server cannot be
+      reached at all (DNS failure, timeout, connection refused, etc.) does
+      it fall back to the last fully-verified cached resolution -- with a
+      warning logged, since that may not reflect the newest kernels.
+    * **Reachability** is checked with a short TCP connect
+      (``QSM_FTP_PROBE_TIMEOUT``, default 3 s) before any FTP connection,
+      and the result is remembered in the process for
+      ``QSM_FTP_RETRY_AFTER`` seconds (default 120): when the server is
+      unreachable, later calls go straight to the fallback. Real FTP
+      connections time out after ``QSM_FTP_TIMEOUT`` seconds (default 30)
+      per socket operation.
+    * **``QSM_OFFLINE=1``** behaves like ``download_kernels=False``.
     * If nothing usable is cached when the server is unreachable, the
       original connectivity error is raised, wrapped in a
       :class:`ConnectionError` with an actionable message (naming any
@@ -657,7 +840,8 @@ def download_kernels_via_ftp(
         retries (its ``missing`` lists them). Nothing is recorded in the
         resolution cache, so the next call tries them again.
     FileNotFoundError
-        If ``download_kernels=False`` and no complete local cache exists.
+        If ``download_kernels=False`` (or ``QSM_OFFLINE`` is set) and no
+        complete local cache exists.
     """
     kernels_dir = Path(kernels_dir)
     cache_path = get_resolution_cache_path(kernels_dir)
@@ -674,10 +858,22 @@ def download_kernels_via_ftp(
             return candidate
         return None
 
+    offline = _offline()
+    # A 'latest' resolution verified online less than QSM_LATEST_MAX_AGE ago
+    # is reused like a pinned version.
+    max_age = _env_seconds("QSM_LATEST_MAX_AGE", _DEFAULT_LATEST_MAX_AGE_SECONDS)
+    checked_at = (cached_entry or {}).get("checked_at")
+    fresh = (
+        is_latest
+        and max_age > 0
+        and isinstance(checked_at, (int, float))
+        and time.time() - checked_at < max_age
+    )
+
     # Pinned versions never change once published, and download_kernels=False
-    # means "never touch the network" regardless of version -- both cases
-    # reuse a fully-verified local copy without any network attempt.
-    if not is_latest or not download_kernels:
+    # (or QSM_OFFLINE) means "never touch the network" regardless of version --
+    # these cases reuse a fully-verified local copy without any network attempt.
+    if not is_latest or fresh or not download_kernels or offline:
         cached_tm = _usable_cached_tm()
         if cached_tm is not None:
             log.debug(
@@ -685,14 +881,16 @@ def download_kernels_via_ftp(
                 f"{cached_tm} -- skipping network check",
             )
             return cached_tm
-        if not download_kernels:
+        if not download_kernels or offline:
+            why = "QSM_OFFLINE is set" if offline else "download_kernels=False"
             raise FileNotFoundError(
-                f"download_kernels=False and no complete local cache is "
+                f"{why} and no complete local cache is "
                 f"available for spacecraft={spacecraft!r} mk={mk!r} "
                 f"version={version!r}. Enable downloads, or pre-populate "
                 "kernels_dir with the required kernels.",
             )
 
+    start = time.monotonic()
     try:
         local_tm = _download_kernels_via_ftp_online(
             spacecraft, mk, kernels_dir, version, n_workers,
@@ -702,12 +900,13 @@ def download_kernels_via_ftp(
     except KernelDownloadError:
         raise  # the server answered; some kernels did not come through
     except ftplib.all_errors as exc:
-        log.warning(f"FTP: could not reach {_FTP_HOST} ({exc})")
+        _could_not_reach(exc, time.monotonic() - start)
         cached_tm = _usable_cached_tm()
         if cached_tm is not None:
             assert cached_entry is not None  # noqa: S101 - implied by cached_tm above
             when = _format_checked_at(cached_entry.get("checked_at"))
-            log.warning(
+            remembered = isinstance(exc, FtpUnreachableError) and exc.remembered
+            (log.info if remembered else log.warning)(
                 f"FTP: offline fallback -- using kernels cached at {cached_tm} "
                 f"(last verified online {when}); "
                 "this may not reflect the latest kernels.",
@@ -755,11 +954,10 @@ def _download_kernels_via_ftp_online(
         f"FTP fallback: connecting to {_FTP_HOST} "
         f"for {spacecraft} (mk='{mk}', version='{version}')",
     )
+    _ensure_ftp_reachable()  # before waiting for a connection slot
     with _ftp_connection_slot():
-        ftp = ftplib.FTP(_FTP_HOST)  # noqa: S321 - public ESA FTP, anonymous login
+        ftp = _connect_ftp()
         try:
-            ftp.login()
-
             remote_tm = _resolve_tm_on_ftp(ftp, spacecraft, mk, base, version=version)
             tm_filename = Path(remote_tm).name
             local_tm = kernels_dir / "mk" / tm_filename
@@ -812,6 +1010,9 @@ def _download_kernels_via_ftp_online(
         failed = _download_batch(pending, kernels_dir, n_workers)
         n_dl += len(pending) - len(failed)
         pending = [(r, loc) for r, loc in pending if _rel(loc, kernels_dir) in failed]
+        known = _reachability
+        if pending and known is not None and not known.ok:
+            break  # the server stopped answering: retrying now would not help
 
     log.info(
         f"FTP: done - {n_dl} downloaded, {n_skip} cached, {len(failed)} failed",
@@ -835,9 +1036,7 @@ def _download_batch(
     with ThreadPoolExecutor(max_workers=n_workers) as pool:
         for remote_kernel, local_kernel in to_download:
             log.debug(f"FTP: queuing {local_kernel.name}")
-            fut = pool.submit(
-                _download_one_kernel, _FTP_HOST, remote_kernel, local_kernel,
-            )
+            fut = pool.submit(_download_one_kernel, remote_kernel, local_kernel)
             futures[fut] = local_kernel
 
         with tqdm(
